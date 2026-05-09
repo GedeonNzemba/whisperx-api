@@ -2567,13 +2567,22 @@ def _run_pipeline(
         transcribe_kwargs["batch_size"] = batch_size
         if not vad:
             transcribe_kwargs["chunk_size"] = 30
+        # WhisperX FasterWhisperPipeline doesn't accept initial_prompt as kwarg;
+        # mutate whisper_model.options briefly, transcribe, restore.
+        from dataclasses import replace
+        _old_opts = None
         if initial_prompt:
-            transcribe_kwargs["initial_prompt"] = initial_prompt
+            _old_opts = whisper_model.options
+            whisper_model.options = replace(_old_opts, initial_prompt=initial_prompt)
         t0 = time.time()
-        transcription = whisper_model.transcribe(
-            audio,
-            **{k: v for k, v in transcribe_kwargs.items() if v is not None},
-        )
+        try:
+            transcription = whisper_model.transcribe(
+                audio,
+                **{k: v for k, v in transcribe_kwargs.items() if v is not None},
+            )
+        finally:
+            if _old_opts is not None:
+                whisper_model.options = _old_opts
     transcribe_time = time.time() - t0
     detected_language = transcription.get("language") or language or "en"
 
@@ -3981,9 +3990,19 @@ class StreamingSession:
             kwargs: Dict[str, Any] = {"batch_size": 4, "chunk_size": 30}
             if self.language:
                 kwargs["language"] = self.language
+            # WhisperX's FasterWhisperPipeline.transcribe() does NOT accept
+            # initial_prompt as a kwarg — it lives on whisper.options.
+            # Mutate the singleton briefly, transcribe, then restore.
+            from dataclasses import replace
+            old_options = None
             if self.initial_prompt:
-                kwargs["initial_prompt"] = self.initial_prompt
-            transcription = whisper.transcribe(audio, **kwargs)
+                old_options = whisper.options
+                whisper.options = replace(old_options, initial_prompt=self.initial_prompt)
+            try:
+                transcription = whisper.transcribe(audio, **kwargs)
+            finally:
+                if old_options is not None:
+                    whisper.options = old_options
 
         segments = transcription.get("segments") or []
         if not segments:
