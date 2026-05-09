@@ -1,0 +1,211 @@
+=============================================================
+  WhisperX API — All Commands Reference
+=============================================================
+
+-------------------------------------------------------------
+1. START SERVER
+-------------------------------------------------------------
+
+cd "/Users/user1/Documents/Projects/speech to text"
+source .venv/bin/activate
+PORT=8001 python server.py
+
+# Check server is running:
+curl http://localhost:8001/health
+
+
+-------------------------------------------------------------
+2. TRANSCRIBE (ASR — no transcript needed)
+-------------------------------------------------------------
+
+# Basic transcription:
+curl -X POST http://localhost:8001/transcribe \
+     -F file=@audio.m4a \
+     -F output_format=json,srt,vtt,txt \
+     -o result.json
+
+# With explicit language:
+curl -X POST http://localhost:8001/transcribe \
+     -F file=@audio.m4a \
+     -F language=en \
+     -F output_format=json,srt,vtt,txt \
+     -o result.json
+
+# With speaker diarization (requires HF_TOKEN env var):
+curl -X POST http://localhost:8001/transcribe \
+     -F file=@audio.m4a \
+     -F language=en \
+     -F diarize=true \
+     -F output_format=json,srt,vtt,txt \
+     -o result.json
+
+# Translate to English (from any language):
+curl -X POST http://localhost:8001/transcribe \
+     -F file=@audio.m4a \
+     -F task=translate \
+     -F output_format=json,srt \
+     -o result.json
+
+
+-------------------------------------------------------------
+3. FORCED ALIGNMENT (you provide the transcript)
+-------------------------------------------------------------
+
+# From a transcript file (RECOMMENDED — avoids shell quoting issues):
+curl -X POST http://localhost:8001/align \
+     -F audio=@audio.m4a \
+     -F "transcript=<transcript.txt" \
+     -F output_format=json,srt,vtt,txt \
+     -o aligned.json
+
+# With explicit language:
+curl -X POST http://localhost:8001/align \
+     -F audio=@audio.m4a \
+     -F "transcript=<transcript.txt" \
+     -F language=en \
+     -F output_format=json,srt,vtt,txt \
+     -o aligned.json
+
+# Inline short transcript:
+curl -X POST http://localhost:8001/align \
+     -F audio=@audio.m4a \
+     -F 'transcript=Hello world. This is a test.' \
+     -F output_format=json,srt \
+     -o aligned.json
+
+# With speaker labels in transcript:
+# (transcript.txt contains lines like "Speaker 1: Hello...")
+curl -X POST http://localhost:8001/align \
+     -F audio=@audio.m4a \
+     -F "transcript=<transcript.txt" \
+     -F language=en \
+     -F output_format=json,srt,vtt,txt \
+     -o aligned.json
+
+
+-------------------------------------------------------------
+4. EXTRACT OUTPUT FILES FROM aligned.json / result.json
+-------------------------------------------------------------
+
+# Extract SRT:
+python3 -c "import json; open('transcript.srt','w').write(json.load(open('aligned.json'))['files']['srt'])"
+python3 -c "import json; open('transcript.srt','w').write(json.load(open('result.json'))['files']['srt'])"
+
+# Extract VTT:
+python3 -c "import json; open('transcript.vtt','w').write(json.load(open('aligned.json'))['files']['vtt'])"
+
+# Extract TXT:
+python3 -c "import json; open('transcript.txt','w').write(json.load(open('aligned.json'))['files']['txt'])"
+
+# Extract all formats at once:
+python3 -c "
+import json
+d = json.load(open('aligned.json'))
+for fmt, content in d.get('files', {}).items():
+    if not fmt.endswith('_base64'):
+        open(f'transcript.{fmt}', 'w').write(content)
+        print(f'Saved transcript.{fmt}')
+"
+
+# Same but from result.json (transcribe output):
+python3 -c "
+import json
+d = json.load(open('result.json'))
+for fmt, content in d.get('files', {}).items():
+    if not fmt.endswith('_base64'):
+        open(f'transcript.{fmt}', 'w').write(content)
+        print(f'Saved transcript.{fmt}')
+"
+
+
+-------------------------------------------------------------
+5. INSPECT / DEBUG aligned.json
+-------------------------------------------------------------
+
+# Quick alignment quality check:
+python3 -c "
+import json
+d = json.load(open('aligned.json'))
+ws = d.get('word_segments', [])
+print('GT words     :', d.get('ground_truth_word_count'))
+print('Interpolated :', d.get('interpolated_word_count'))
+print('Total aligned:', len(ws))
+print('Audio duration:', d.get('duration_seconds'), 's')
+print('Warning      :', d.get('warning'))
+if ws:
+    print('First word   :', ws[0].get('word'), '@', ws[0].get('start'), 's')
+    print('Last word    :', ws[-1].get('word'), '@', ws[-1].get('end'), 's')
+"
+
+# Print all word timestamps:
+python3 -c "
+import json
+ws = json.load(open('aligned.json'))['word_segments']
+for w in ws:
+    print(f\"{w.get('start',0):7.3f}s  {w.get('word')}\")
+"
+
+# Print segments (one per speaker turn):
+python3 -c "
+import json
+segs = json.load(open('aligned.json'))['segments']
+for s in segs:
+    spk = s.get('speaker') or ''
+    print(f\"{s['start']:.2f} --> {s['end']:.2f}  [{spk}]  {s['text'][:80]}\")
+"
+
+# Check transcription result.json:
+python3 -c "
+import json
+d = json.load(open('result.json'))
+ws = d.get('word_segments', [])
+print('Language     :', d.get('language'))
+print('Duration     :', d.get('duration_seconds'), 's')
+print('Total words  :', len(ws))
+print('Diarized     :', d.get('diarized'))
+if ws:
+    print('First word   :', ws[0].get('word'), '@', ws[0].get('start'), 's')
+    print('Last word    :', ws[-1].get('word'), '@', ws[-1].get('end'), 's')
+"
+
+
+-------------------------------------------------------------
+6. DOWNLOAD LINKS (if using /download endpoint)
+-------------------------------------------------------------
+
+# Get download links from response:
+python3 -c "
+import json
+d = json.load(open('aligned.json'))
+for fmt, link in d.get('download_links', {}).items():
+    print(fmt, ':', 'http://localhost:8001' + link)
+"
+
+# Download a specific file using the link:
+curl http://localhost:8001/download/<file_id>/transcript.srt -o transcript.srt
+
+
+-------------------------------------------------------------
+7. WEB UI
+-------------------------------------------------------------
+
+# Open in browser:
+open http://localhost:8001
+
+
+-------------------------------------------------------------
+8. NOTES
+-------------------------------------------------------------
+
+- Always use  -F "transcript=<yourfile.txt"  (not $(cat file))
+  Shell expansion breaks on special chars like ; " curly-quotes !
+
+- Language codes: en fr de es ar zh ja ko pt ru nl ...
+
+- Output formats: json, srt, vtt, txt  (comma-separated, json always included)
+
+- Speaker diarization needs HF_TOKEN env variable:
+    export HF_TOKEN=hf_yourtoken
+    PORT=8001 python server.py
+
+=============================================================

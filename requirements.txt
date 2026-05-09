@@ -1,0 +1,38 @@
+# Core API
+fastapi==0.115.4
+uvicorn[standard]==0.32.0
+python-multipart==0.0.12
+pydantic==2.9.2
+
+# Speech / ML stack
+# torch 2.6.0 is required by chatterbox-tts; compatible with whisperx, faster-whisper, ctranslate2.
+# CUDA 12.4 wheels (cu124) match our base image nvidia/cuda:12.4.0-runtime-ubuntu22.04.
+torch==2.6.0
+torchaudio==2.6.0
+faster-whisper==1.1.0
+whisperx==3.3.1
+pyannote.audio==3.3.2
+ctranslate2==4.4.0
+
+# CPU-only diarization backend (default). Faster, no HF token required, lower DER.
+# Apache 2.0. https://github.com/FoxNoseTech/diarize
+diarize>=0.1.2
+
+# Audio handling
+soundfile==0.12.1
+librosa>=0.10.2,<0.12
+numpy<2
+
+# Misc
+huggingface-hub==0.25.2
+langdetect==1.0.9
+
+# Apple Silicon acceleration (auto-skipped on Linux/Windows / Intel Macs).
+lightning-whisper-mlx==0.0.10; sys_platform == "darwin" and platform_machine == "arm64"
+mlx>=0.18.0; sys_platform == "darwin" and platform_machine == "arm64"
+
+# ---------------------------------------------------------------------------
+# Speech-to-speech translation (Phase 1) — chatterbox-tts + NLLB-200.
+# chatterbox-tts is installed as a separate pip step in the Dockerfile so
+# its git-hosted dependency (resemble-perth) resolves correctly.
+# ---------------------------------------------------------------------------

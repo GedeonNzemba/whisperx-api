@@ -1,0 +1,31 @@
+# HuggingFace Spaces requirements (CUDA / Linux).
+# No MLX (Apple-only). Adds the `spaces` SDK for ZeroGPU.
+
+fastapi==0.115.4
+uvicorn[standard]==0.32.0
+python-multipart==0.0.12
+pydantic==2.9.2
+
+# Torch with CUDA wheels are provided by the Spaces base image.
+torch==2.3.1
+torchaudio==2.3.1
+faster-whisper==1.1.0
+whisperx==3.3.1
+pyannote.audio==3.3.2
+ctranslate2==4.4.0
+# CPU-only diarization backend (default). See requirements.txt for details.
+diarize>=0.1.2
+
+soundfile==0.12.1
+librosa==0.10.2.post1
+numpy<2
+
+huggingface-hub==0.25.2
+langdetect==1.0.9
+
+# Universal forced alignment for unsupported languages (Meta MMS).
+transformers==4.46.2
+uroman==1.3.1.1
+
+# ZeroGPU SDK
+spaces

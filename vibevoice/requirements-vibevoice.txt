@@ -1,0 +1,18 @@
+# Isolated dependency set for the VibeVoice-ASR sidecar.
+# Install into a SEPARATE venv (e.g. /app/vibevoice/.venv) so it does not
+# disturb the main server's transformers 4.x stack used by WhisperX.
+#
+#   python3 -m venv /app/vibevoice/.venv
+#   /app/vibevoice/.venv/bin/pip install -r vibevoice/requirements-vibevoice.txt
+
+transformers>=5.3.0
+accelerate>=1.0.0
+torch>=2.1.0
+torchaudio>=2.1.0
+soundfile>=0.12.1
+numpy>=1.24
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+huggingface_hub>=1.5.0
+safetensors>=0.4

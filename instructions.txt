@@ -1,0 +1,61 @@
+You are an expert in speech AI systems and production backend engineering. Your task is to generate a complete, self-contained, production‑ready **WhisperX Large V3 API server** that I can drop into any personal project. The server must expose a simple REST API, leverage the full WhisperX pipeline including speaker diarization, and adhere to the specifications below. Output every file needed to run the server locally or in a container (Docker) without manual intervention after cloning.
+
+## Core technology stack (use this exact foundation)
+- **Python 3.10+** with `fastapi` + `uvicorn` for the REST API
+- **WhisperX** (`whisperx`) using `faster-whisper` backend and **Large V3** model
+- **`pyannote.audio`** for speaker diarization (pipeline from HuggingFace, model: `pyannote/speaker-diarization-3.1` or latest)
+- **`wav2vec2`** alignment model from WhisperX (e.g., `facebook/wav2vec2-large-960h-lv60-self` for English; detect language and pick corresponding alignment model automatically for other languages where available, or fall back graciously)
+- **Silero VAD** as integrated by WhisperX
+- **GPU acceleration** with CUDA – the server must assume an NVIDIA GPU with at least 8GB VRAM (set beam_size=5, batch_size dynamic)
+- **Docker** support: provide a `Dockerfile` using `nvidia/cuda:12.1.0-runtime-ubuntu22.04` as base, install all dependencies, and run the API
+
+## What the server must do
+The API must accept an audio file (any common format: WAV, MP3, FLAC, OGG, M4A, etc.) via a single `POST /transcribe` endpoint, with optional query/form parameters, and return structured results plus downloadable subtitle files. It must fully implement all the WhisperX capabilities detailed below.
+
+### 1. High‑Accuracy Transcription
+- Use **Whisper Large V3** (via `faster-whisper`) for speech‑to‑text.
+- Automatically detect language (`language=None`) unless the user explicitly provides a `language` parameter (ISO 639-1 code).
+- Produce **word‑level timestamps** with ±50ms accuracy by running forced alignment after transcription.
+- Support **99+ languages** – the language detection and alignment model selection must work out‑of‑the‑box.
+- For English (or when align model is unavailable for a language), use a reasonable fallback (e.g., English align model) but clearly mark in response that timestamps may be less accurate.
+
+### 2. Advanced Speaker Diarization
+- Enable speaker diarization **on demand** via a boolean parameter `diarize` (default `true` when authentication token is provided, see below).
+- Because `pyannote.audio` requires a HuggingFace access token for the diarization model, add an environment variable `HF_TOKEN` to the Dockerfile/script; the server reads it on startup and passes it transparently. If not set, diarization is disabled, and the API returns a clear error if a user requests it.
+- Assign speaker labels (`SPEAKER_00`, `SPEAKER_01`, …) and embed them in every output format where applicable (SRT, VTT, JSON, TXT with speaker tags).
+- Ensure diarization works seamlessly with word‑level timestamps: after diarization, assign speaker to each word segment, and then reconstruct sentence/segment‑level speaker annotations.
+
+### 3. Fast & Efficient Processing
+- Use batched inference (`faster-whisper`) to achieve **70x real‑time** throughput (i.e., process 1 hour of audio in ~1‑3 minutes on a modern GPU).
+- Integrate **Silero VAD** to strip silence before transcription, reducing hallucinations and accelerating processing. VAD should be on by default, with a toggle `vad` (bool) allowed for advanced users.
+- Keep GPU memory usage under **8GB** with `beam_size=5`. Dynamically set batch size based on audio duration and available VRAM (simple heuristic: 16 for short audio <5min, 8 for up to 30min, 4 for longer, or let `whisperx` auto‑tune). No OOM should occur.
+- Handle **long audio** gracefully by automatically splitting into 30‑second chunks (the default WhisperX chunking) with overlap.
+
+### 4. Output and Integration
+- Support multiple output formats controlled by an `output_format` parameter (comma‑separated: `txt,srt,vtt,json`). Default: `json`.
+  - **JSON**: Full structured data with word‑level timestamps, speaker labels per word and per segment, detected language, processing time. Return this directly in the HTTP response body.
+  - **TXT**: Plain text with speaker labels (e.g., `[SPEAKER_00]: Hello world.`). If no diarization, just transcript.
+  - **SRT**, **VTT**: Standard subtitle formats with speaker prefix per cue (e.g., `SPEAKER_00\nsubtitles`). Include proper sequence numbering for SRT.
+- The JSON response must additionally contain **downloadable links** for the requested file‑based formats (the server stores temporary files and serves them via a `/download/{file_id}` endpoint for a limited time, or use base64‑encoded data inline – choose base64 inline to keep it stateless and simple). So the JSON response includes fields like `txt`, `srt`, `vtt` containing the content strings or base64.
+- Provide a `POST /health` or `GET /health` endpoint returning GPU status, model load status, VRAM usage, and uptime.
+- Add CORS middleware (allow all origins) so the API can be called from any frontend.
+
+## Deployment & Usage
+- The server must be startable with a single command: `python server.py` or via Docker: `docker run --gpus all -p 8000:8000 whisperx-server`.
+- On first launch, it downloads all necessary models (Whisper large-v3, alignment model, VAD model, diarization pipeline) and caches them inside the container or in a local `./models` directory.
+- Include a comprehensive `README.md` explaining setup, environment variables (`HF_TOKEN`, `PORT`, `MAX_AUDIO_DURATION`), usage of the API with `curl` examples, and the performance characteristics.
+
+## Error Handling & Edge Cases
+- Validate input file size (configurable max, default 500MB), reject non‑audio files with clear error.
+- Return user‑friendly JSON errors on transcribe failures (out of memory, unsupported language, diarization token missing).
+- Log all requests and processing times.
+
+## Deliverables
+Generate the following files as a complete, runnable project:
+1. `server.py` – FastAPI application with the `/transcribe`, `/download`, `/health` endpoints.
+2. `requirements.txt` – pinned versions of `faster-whisper`, `whisperx`, `torch`, `torchaudio`, `pyannote.audio`, `fastapi`, `uvicorn`, `pydantic`, `python-multipart`, etc.
+3. `Dockerfile` – multistage with CUDA base, installs ffmpeg, Python, dependencies, copies `server.py`, exposes port.
+4. `README.md` – setup and usage instructions as described.
+5. (optional) `.env.example` and a simple client test script.
+
+Now, write the full implementation of all files. Your response must contain the actual code blocks for each file, ready to copy and execute. Make sure the server fully respects all the specifications above and that no placeholders remain – produce working, production‑grade code.

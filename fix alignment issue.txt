@@ -1,0 +1,65 @@
+You are an expert in speech processing and the WhisperX codebase. You have an existing WhisperX Large V3 server with a `/align` endpoint that performs forced alignment of a user‑provided ground‑truth transcript against an audio file. The endpoint currently has a critical bug: it only aligns the first ~25 seconds of a 120‑second audio and ignores the rest of the transcript. The root cause is that the alignment code passes the entire transcript as a single segment spanning the whole audio to WhisperX’s `align()` function, which cannot handle extremely long alignment windows (its CTC forced alignment trellis collapses for segments longer than ~30 seconds). The fix must ensure that every single word of the provided transcript receives accurate word‑level timestamps covering the **full duration** of the audio.
+
+## Mandatory Requirements
+
+1. **Full‑duration alignment** – Every word from the ground‑truth transcript must be aligned and returned with a start and end timestamp. No truncation. The solution must work for any audio length (e.g., 2 minutes, 10 minutes, 1 hour).
+
+2. **Keep the existing API contract unchanged** – The `/align` endpoint must continue to accept:
+   - `audio` (file)
+   - `transcript` (string, exact ground truth)
+   - `language` (optional)
+   - `vad` (boolean, default true)
+   - `diarize` (boolean)
+   - `output_format` (comma‑separated string)
+   The response JSON structure must remain identical (word‑level timestamps, segments, speaker labels if diarized, downloadable TXT/SRT/VTT content).
+
+3. **Use only the existing dependencies** – Do not introduce new external libraries. The fix must work within the current WhisperX ecosystem (`whisperx`, `faster-whisper`, `torch`, `torchaudio`, `pyannote.audio`, `Silero VAD`, etc.).
+
+4. **Performance** – The alignment step must be efficient and not significantly slower than the original transcription endpoint for audio of the same length (target: process 2 minutes of audio in under 30–60 seconds on a modern GPU).
+
+## Root Cause (for your understanding)
+WhisperX’s `align()` function is designed for short audio segments (typically ≤30 seconds, as produced by the transcription pipeline’s VAD chunker). When passed a single segment with `start=0` and `end=120`, the wav2vec2 CTC alignment algorithm encounters a massive probability trellis where the blank‑dominated regions drown out the emission probabilities of the speech tokens, causing the Viterbi backtracking to fail after a short initial portion. The solution is to **split the audio into short, speech‑filled chunks before aligning**, distribute the ground‑truth transcript across those chunks, and then align each chunk individually.
+
+## Implementation Strategy (you must implement this exact method)
+
+### Step 1: Obtain short speech segments from the audio
+- If the user passes `vad=true` (the default), run **Silero VAD** on the audio to obtain `[start, end]` timestamps of speech regions. These will naturally be short (typically 2–20 seconds) and perfectly suited for alignment.
+- If `vad=false`, automatically split the audio into fixed‑length chunks of 25 seconds with a 2‑second overlap (this is the fallback to ensure chunking even without VAD).
+
+### Step 2: Distribute the ground‑truth transcript across the chunks
+- The server receives a single transcript string. It may contain speaker labels like “Speaker A: Hello. Speaker B: Hi.”, or just plain text.
+- **Parse the transcript** into a sequence of words (preserving any speaker boundaries if diarization is requested later).
+- Run a **lightweight transcription pass** using the **smallest possible Whisper model** (e.g., `tiny` or `base`) on the same audio, purely to get estimated word‑level timestamps. This fast pass will already produce the VAD‑based chunks (if you call `model.transcribe(audio)` it automatically chunks using VAD).
+- Use the estimated word timestamps to split the ground‑truth transcript into segments that correspond exactly to the ASR chunks. A reliable heuristic:
+  - For each ASR segment, count the number of transcribed words (`n`).
+  - Take the next `n` words from the ground‑truth transcript and assign them to that segment.
+  - Replace the segment’s `text` with the corresponding ground‑truth words.
+  - If the ground truth has speaker annotations, map each speaker’s utterance to the segments that overlap its time range (you can use the ASR timestamps for the mapping).
+- If a lightweight transcription pass is absolutely impossible due to constraints, implement an alternative: split the audio into VAD chunks, then distribute the transcript heuristically by splitting the total word count proportionally to chunk durations, and adjust by aligning each chunk’s word boundaries using a simple DTW on the raw audio/text after the initial assignment. **However**, the recommended transcription‑assisted method is far more robust and must be your primary approach. The fallback may be less accurate but must still produce word‑level timestamps for the whole audio.
+
+### Step 3: Align each chunk individually
+- For each segment (now with correct text and a short duration), call WhisperX’s `align()` function. The alignment will succeed perfectly because the audio window is now small.
+- Collect the aligned word objects from all chunks and combine them into a single list of words for the entire audio.
+
+### Step 4: Reassemble segments and apply diarization (if requested)
+- If diarization was requested (`diarize=true`), run `pyannote.audio` on the full audio to get speaker turns.
+- Use the speaker turn timestamps to assign a `speaker` field to each aligned word (based on its start time).
+- Reconstruct the output segments by grouping words into sentences or speaker turns as appropriate (you can reuse the ground‑truth sentence boundaries extracted from the original transcript, or simply re‑segment at punctuation marks and speaker labels). Ensure the final JSON structure matches the original `/transcribe` output exactly.
+
+### Step 5: Generate output files
+- Produce TXT, SRT, VTT content from the aligned words/segments, with speaker labels when diarized.
+- Return the JSON response with base64‑encoded or raw string representations of those files, just as the current implementation does.
+
+## Edge Cases and Error Handling
+- If the ground‑truth transcript contains words that cannot be found in the audio (e.g., extra phrases), the aligner may drop them. After alignment, fill missing words by linearly interpolating timestamps between the previous and next aligned word, and clearly mark them with a warning in the JSON response (`"warning": "Some words could not be aligned and were interpolated"`).
+- If the language is not specified, auto‑detect it from the first few words of the transcript (using a small language detection library or simple substring matching) to choose the correct wav2vec2 alignment model.
+- Maintain GPU memory under 8GB – process chunks sequentially, not in parallel.
+- Validate that after fix, a 2‑minute audio with a full transcript returns word‑level timestamps that span from 0s to ~120s, with no missing tail.
+
+## Backward Compatibility
+**The existing `/transcribe` endpoint and the web UI must remain completely functional and unchanged.** Only the `/align` logic should be modified. Do not alter the signature, response format, or behaviour of any other part of the server.
+
+## Deliverables
+Provide the **complete updated `server.py`** with the fixed `/align` endpoint. The code must be production‑ready, well‑commented, and incorporate the strategy above. Additionally, update the **`index.html`** web interface if needed (for example, to display warnings about interpolated words), but the primary deliverable is the server code.
+
+Write the code.

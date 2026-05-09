@@ -1,0 +1,59 @@
+You are an expert in real‑time speech systems and the 2026 open‑source TTS
+landscape. Our server already has a working `/ws/stt` WebSocket endpoint
+that streams real‑time transcription from WhisperX Large‑V3. We need to
+add real‑time speech‑to‑speech translation.
+
+## Architecture
+
+Use a cascaded pipeline:
+  Mic → AEC (optional, Phase 2) → STT (existing WhisperX) → MT (LLM) → TTS → Speaker
+
+For Phase 1, assume the user wears headphones (no echo cancellation needed).
+
+## TTS Engine
+
+Integrate **Chatterbox‑Turbo** (MIT license, 350M params, <200ms latency) for
+English output. If multilingual output is needed, use **Voxtral TTS**
+(Apache 2.0, 9 languages, 90ms TTFA).
+
+Requirements:
+- Load the TTS model ONCE at startup alongside the existing WhisperX model.
+- Provide a reference voice clip (bundled with the server) for zero‑shot
+  voice cloning so the output always uses a consistent, natural voice.
+- The TTS must run on the same GPU as WhisperX. Total VRAM must stay under
+  24 GB (RTX 4090).
+
+## New WebSocket Endpoint: `/ws/s2s`
+
+Add a new WebSocket endpoint that:
+- Accepts the same PCM audio frames as `/ws/stt`.
+- After each transcribed segment, runs machine translation (use a small,
+  fast model like NLLB‑200‑distilled‑600M or Gemma‑3‑12B via transformers),
+  then feeds the translated text to TTS.
+- Returns both the translated text (JSON) and the generated audio
+  (binary PCM, 24 kHz) to the client over the same WebSocket.
+- The client plays the audio through its speakers.
+
+## Protocol Extension
+
+Add new message types:
+  Server → Client: {"type": "translation", "segment_id": N, "source_text": "...",
+                      "translated_text": "...", "source_lang": "en", "target_lang": "fr"}
+  Server → Client: {"type": "audio", "segment_id": N, "sample_rate": 24000,
+                      "duration_s": S}
+  (followed by binary PCM frames)
+
+Add new start parameter: "target_language" (ISO 639‑1).
+
+## Keep Existing Endpoints Unchanged
+- `/ws/stt` continues to work exactly as before.
+- `/session/diarize`, `/transcribe`, `/align` are untouched.
+
+## Performance Targets
+- End‑to‑end latency (speech in → translated speech out): <2 seconds for
+  short utterances.
+- TTS time‑to‑first‑audio: <300ms after translated text is available.
+- Total VRAM: ≤24 GB.
+
+Write production‑grade Python code for the new WebSocket handler and the
+TTS integration. Keep all existing functionality intact.

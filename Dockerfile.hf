@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1.6
+# Dockerfile for HuggingFace Spaces (ZeroGPU). Rename to `Dockerfile`
+# when deploying to a Spaces repo.
+
+FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PORT=7860 \
+    HOST=0.0.0.0 \
+    # --- ASR config (max accuracy on H200 GPU) ---
+    ASR_BACKEND=whisperx \
+    WHISPER_MODEL=large-v3 \
+    COMPUTE_TYPE=float16 \
+    BEAM_SIZE=10 \
+    MAX_AUDIO_DURATION=86400 \
+    # --- Paths ---
+    MODEL_DIR=/app/models \
+    HF_HOME=/app/models/hf \
+    TORCH_HOME=/app/models/torch \
+    XDG_CACHE_HOME=/app/models/cache
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.10 python3.10-venv python3-pip \
+        build-essential git ffmpeg libsndfile1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.10 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.10 /usr/local/bin/python3 \
+    && python -m pip install --upgrade pip wheel setuptools
+
+WORKDIR /app
+COPY requirements-hf.txt /app/requirements.txt
+
+RUN pip install --extra-index-url https://download.pytorch.org/whl/cu121 \
+        torch==2.3.1+cu121 torchaudio==2.3.1+cu121 \
+    && pip install -r /app/requirements.txt
+
+COPY server.py app.py /app/
+COPY static /app/static
+RUN mkdir -p /app/models
+
+EXPOSE 7860
+
+CMD ["python", "app.py"]
