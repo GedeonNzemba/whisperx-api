@@ -36,6 +36,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+
+# torch 2.6 changed `torch.load` to default `weights_only=True`, which breaks
+# many older checkpoints (WhisperX/pyannote/chatterbox use omegaconf ListConfig
+# and other globals not in the default allowlist). Patch the default back to
+# False — safe because we only load checkpoints we trust (HuggingFace + our
+# own bundled models).
+_torch_load_orig = torch.load
+def _torch_load_patched(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _torch_load_orig(*args, **kwargs)
+torch.load = _torch_load_patched
+
 import whisperx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
