@@ -37,21 +37,43 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-# torch 2.6 changed `torch.load` to default `weights_only=True`. Many trusted
-# checkpoints (whisperx/pyannote/chatterbox) use omegaconf containers which
-# aren't in the default allowlist. Whitelist them explicitly so loading works.
+# torch 2.6 defaults torch.load(weights_only=True), rejecting many trusted
+# globals used by whisperx / pyannote / lightning / chatterbox checkpoints.
+# Allowlist the full set we know are needed.
 import torch.serialization  # noqa: E402
 try:
     from omegaconf.listconfig import ListConfig
     from omegaconf.dictconfig import DictConfig
-    from omegaconf import OmegaConf
-    torch.serialization.add_safe_globals([ListConfig, DictConfig, OmegaConf])
+    from omegaconf.base import ContainerMetadata, Metadata
+    from omegaconf.nodes import AnyNode
+    from pyannote.audio.core.model import Introspection
+    from pyannote.audio.core.task import Specifications, Problem, Resolution
+    from typing import Any
+    from collections import defaultdict
+
+    torch.serialization.add_safe_globals([
+        ListConfig,
+        DictConfig,
+        ContainerMetadata,
+        Metadata,
+        AnyNode,
+        Any,
+        list,
+        defaultdict,
+        dict,
+        int,
+        torch.torch_version.TorchVersion,
+        Introspection,
+        Specifications,
+        Problem,
+        Resolution,
+    ])
 except Exception:  # noqa: BLE001
     pass
 
 # Belt-and-braces: also patch torch.load default to weights_only=False, since
-# some checkpoints use globals beyond just omegaconf. We trust all sources
-# (HuggingFace + bundled models).
+# some checkpoints use globals beyond the allowlist above. We trust all
+# sources (HuggingFace + bundled models).
 _torch_load_orig = torch.load
 def _torch_load_patched(*args, **kwargs):
     kwargs.setdefault("weights_only", False)
