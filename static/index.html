@@ -809,11 +809,19 @@
           </select>
         </div>
 
-        <div class="row" style="gap:10px;margin-top:16px;">
-          <button class="primary" id="s2s-start" type="button">🎤 Start</button>
+        <div class="row" style="gap:10px;margin-top:16px;align-items:center;">
+          <button class="primary" id="s2s-start" type="button" disabled>🎤 Start</button>
           <button class="primary" id="s2s-stop" type="button" disabled style="background:var(--err);">⏹ Stop</button>
+          <span id="s2s-health" title="Server health" style="margin-left:auto;display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:4px 10px;border-radius:999px;border:1px solid var(--border);background:#0c1017;color:var(--muted);">
+            <span id="s2s-health-dot" style="width:8px;height:8px;border-radius:50%;background:#888;display:inline-block;"></span>
+            <span id="s2s-health-text">Checking…</span>
+          </span>
         </div>
         <div class="status" id="s2s-status">Ready.</div>
+        <div>
+          <label style="margin-bottom:4px;margin-top:10px;">⚠️ Status / errors</label>
+          <div id="s2s-errors" style="min-height:40px;max-height:140px;overflow-y:auto;background:#0c1017;border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);white-space:pre-wrap;">No errors.</div>
+        </div>
       </div>
 
       <div class="card" style="display:flex;flex-direction:column;gap:14px;">
@@ -1903,128 +1911,305 @@ baAddRow();
 })();
 
 (function s2sPanel() {
-  const startBtn     = document.getElementById('s2s-start');
-  const stopBtn      = document.getElementById('s2s-stop');
-  const statusEl     = document.getElementById('s2s-status');
-  const transcriptEl = document.getElementById('s2s-transcript');
-  const translationEl= document.getElementById('s2s-translation');
-  const audioEl      = document.getElementById('s2s-audio');
-  const audioPhEl    = document.getElementById('s2s-audio-placeholder');
-  const srcLangEl    = document.getElementById('s2s-src-lang');
-  const tgtLangEl    = document.getElementById('s2s-tgt-lang');
+  const startBtn      = document.getElementById('s2s-start');
+  const stopBtn       = document.getElementById('s2s-stop');
+  const statusEl      = document.getElementById('s2s-status');
+  const transcriptEl  = document.getElementById('s2s-transcript');
+  const translationEl = document.getElementById('s2s-translation');
+  const audioEl       = document.getElementById('s2s-audio');
+  const audioPhEl     = document.getElementById('s2s-audio-placeholder');
+  const srcLangEl     = document.getElementById('s2s-src-lang');
+  const tgtLangEl     = document.getElementById('s2s-tgt-lang');
+  const errorsEl      = document.getElementById('s2s-errors');
+  const healthDotEl   = document.getElementById('s2s-health-dot');
+  const healthTextEl  = document.getElementById('s2s-health-text');
 
-  let ws = null, audioCtx = null, mediaStream = null, processorNode = null, sourceNode = null;
-  let audioChunks = [];
+  const TAG = '[s2s]';
+  const ts  = () => new Date().toISOString().split('T')[1].replace('Z', '');
+  const log = (...a) => console.log(TAG, ts(), ...a);
+  const warn = (...a) => console.warn(TAG, ts(), ...a);
+  const err  = (...a) => console.error(TAG, ts(), ...a);
+
+  let ws = null, audioCtx = null, playbackCtx = null;
+  let mediaStream = null, processorNode = null, sourceNode = null;
+  let healthOk = false, sessionActive = false, stopRequested = false;
+  let pendingAudioMeta = null; // {sample_rate, segment_id, duration_s}
+  let segmentCounter = 0;
+  let nextPlaybackAt = 0;
 
   function setStatus(msg, cls) {
     statusEl.textContent = msg;
     statusEl.className = 'status' + (cls ? ' ' + cls : '');
   }
 
+  function appendError(msg) {
+    const line = `[${ts()}] ${msg}`;
+    if (errorsEl.textContent === 'No errors.') errorsEl.textContent = line;
+    else errorsEl.textContent += '\n' + line;
+    errorsEl.style.color = 'var(--err)';
+    errorsEl.scrollTop = errorsEl.scrollHeight;
+  }
+  function clearErrors() {
+    errorsEl.textContent = 'No errors.';
+    errorsEl.style.color = 'var(--muted)';
+  }
+
+  function setHealth(state, text) {
+    const colors = { green: '#22c55e', red: '#ef4444', amber: '#f59e0b', gray: '#888' };
+    healthDotEl.style.background = colors[state] || colors.gray;
+    healthTextEl.textContent = text;
+    healthOk = (state === 'green');
+    if (!sessionActive) startBtn.disabled = !healthOk;
+  }
+
+  async function checkHealth() {
+    const url = `${location.origin}/health`;
+    try {
+      const r = await fetch(url, { cache: 'no-store' });
+      if (!r.ok) {
+        setHealth('red', `Server unreachable (HTTP ${r.status})`);
+        log('health check FAIL', r.status);
+        return;
+      }
+      const j = await r.json();
+      if (j.s2s_enabled) {
+        setHealth('green', `Connected · ${j.s2s_tts_backend || 'tts'}`);
+        log('health OK', j);
+      } else {
+        setHealth('amber', 'S2S disabled on server');
+        warn('health: s2s disabled', j);
+      }
+    } catch (e) {
+      setHealth('red', 'Server unreachable');
+      err('health check error:', e);
+    }
+  }
+
+  // Initial check + 5 s polling.
+  checkHealth();
+  setInterval(checkHealth, 5000);
+
   async function start() {
+    if (!healthOk) { appendError('Cannot start: server is not reachable.'); return; }
+    clearErrors();
+    sessionActive = true;
+    stopRequested = false;
     startBtn.disabled = true;
     stopBtn.disabled = false;
     transcriptEl.textContent = '—';
     translationEl.textContent = '—';
     audioEl.style.display = 'none';
     audioPhEl.style.display = 'block';
-    audioChunks = [];
+    pendingAudioMeta = null;
+    segmentCounter = 0;
+    nextPlaybackAt = 0;
     setStatus('Connecting…');
 
-    const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const wsUrl = `${wsProto}://${location.host}/ws/s2s`;
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${location.host}/ws/s2s`;
+    log('opening WebSocket:', wsUrl);
 
     try {
       ws = new WebSocket(wsUrl);
       ws.binaryType = 'arraybuffer';
     } catch (e) {
-      setStatus('WebSocket error: ' + e.message, 'err');
+      appendError('WebSocket construction failed: ' + e.message);
+      err('ws ctor error:', e);
       cleanup(); return;
     }
 
     ws.onopen = async () => {
-      setStatus('Connected — starting microphone…');
-      ws.send(JSON.stringify({
+      log('WebSocket opened');
+      const startMsg = {
         type: 'start',
         language: srcLangEl.value.trim() || null,
-        target_language: tgtLangEl.value || 'en'
-      }));
+        target_language: tgtLangEl.value || 'en',
+      };
+      log('→ sending start:', startMsg);
+      ws.send(JSON.stringify(startMsg));
 
       try {
         mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        log('mic acquired');
       } catch (e) {
-        setStatus('Microphone error: ' + e.message, 'err');
+        appendError('Microphone error: ' + e.message);
+        err('getUserMedia failed:', e);
         cleanup(); return;
       }
 
-      audioCtx = new AudioContext({ sampleRate: 16000 });
-      sourceNode = audioCtx.createMediaStreamSource(mediaStream);
-      await audioCtx.audioWorklet.addModule(
-        'data:application/javascript,' + encodeURIComponent(`
-          class PCMProcessor extends AudioWorkletProcessor {
-            process(inputs) {
-              const ch = inputs[0][0];
-              if (ch) this.port.postMessage(ch.buffer, [ch.buffer]);
-              return true;
+      try {
+        audioCtx = new AudioContext({ sampleRate: 16000 });
+        sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+        await audioCtx.audioWorklet.addModule(
+          'data:application/javascript,' + encodeURIComponent(`
+            class PCMProcessor extends AudioWorkletProcessor {
+              process(inputs) {
+                const ch = inputs[0][0];
+                if (ch) this.port.postMessage(ch.buffer, [ch.buffer]);
+                return true;
+              }
             }
-          }
-          registerProcessor('pcm-processor', PCMProcessor);
-        `)
-      );
-      processorNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
-      processorNode.port.onmessage = e => {
-        if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data);
-      };
-      sourceNode.connect(processorNode);
+            registerProcessor('pcm-processor', PCMProcessor);
+          `)
+        );
+        processorNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
+        processorNode.port.onmessage = e => {
+          if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data);
+        };
+        sourceNode.connect(processorNode);
+        log('mic pipeline running @ 16 kHz');
+      } catch (e) {
+        appendError('Audio pipeline error: ' + e.message);
+        err('audio init failed:', e);
+        cleanup(); return;
+      }
+
       setStatus('🔴 Recording — speak now…', 'ok');
     };
 
     ws.onmessage = e => {
+      // Binary frames: float32 PCM audio for the most-recent `audio` header.
       if (e.data instanceof ArrayBuffer) {
-        audioChunks.push(new Float32Array(e.data));
+        if (!pendingAudioMeta) {
+          warn('binary frame received with no pending audio meta — ignoring');
+          return;
+        }
+        const meta = pendingAudioMeta;
+        pendingAudioMeta = null;
+        const samples = new Float32Array(e.data);
+        log(`audio bytes for seg #${meta.segment_id}: ${samples.length} samples @ ${meta.sample_rate} Hz`);
+        playPCM(samples, meta.sample_rate, meta.segment_id);
         return;
       }
-      let msg;
-      try { msg = JSON.parse(e.data); } catch { return; }
 
-      if (msg.type === 'error') { setStatus('Server error: ' + (msg.error || msg.message || 'unknown'), 'err'); cleanup(); return; }
-      if (msg.type === 'ready') { setStatus('🔴 Recording — speak now…', 'ok'); return; }
-      if (msg.type === 'final' && msg.text) { transcriptEl.textContent = msg.text; setStatus('Translating…'); return; }
-      if (msg.type === 'translation' && msg.text) { translationEl.textContent = msg.text; setStatus('Synthesising speech…'); return; }
-      if (msg.type === 'done') {
-        if (audioChunks.length) {
-          const total = audioChunks.reduce((n, c) => n + c.length, 0);
-          const merged = new Float32Array(total);
-          let off = 0;
-          for (const c of audioChunks) { merged.set(c, off); off += c.length; }
-          const sr = msg.sample_rate || 24000;
-          const wav = float32ToWav(merged, sr);
-          const blob = new Blob([wav], { type: 'audio/wav' });
-          audioEl.src = URL.createObjectURL(blob);
-          audioEl.style.display = 'block';
-          audioPhEl.style.display = 'none';
-          audioEl.play().catch(() => {});
-        }
-        setStatus('✅ Done.', 'ok');
-        cleanup();
+      let msg;
+      try { msg = JSON.parse(e.data); }
+      catch (parseErr) { err('non-JSON text frame:', e.data); return; }
+
+      log('← message:', msg.type, msg);
+
+      switch (msg.type) {
+        case 'ready':
+          log(`session ready · id=${msg.session_id} sr=${msg.sample_rate} backend=${msg.tts_backend}`);
+          setStatus('🔴 Recording — speak now…', 'ok');
+          break;
+        case 'final':
+          if (msg.text) {
+            transcriptEl.textContent = msg.text;
+            log('final transcription:', msg.text);
+            setStatus('Translating…');
+          }
+          break;
+        case 'translation':
+          if (msg.translated_text) {
+            translationEl.textContent = msg.translated_text;
+            log(`translation [${msg.source_lang}→${msg.target_lang}]:`, msg.source_text, '→', msg.translated_text);
+            setStatus('Synthesising speech…');
+          }
+          break;
+        case 'audio':
+          pendingAudioMeta = {
+            sample_rate: msg.sample_rate || 24000,
+            segment_id: msg.segment_id,
+            duration_s: msg.duration_s,
+          };
+          log(`audio header for seg #${msg.segment_id}: dur=${msg.duration_s}s sr=${msg.sample_rate}Hz`);
+          break;
+        case 'audio_skipped':
+          appendError(`TTS skipped for segment #${msg.segment_id}: ${msg.reason}`);
+          warn('audio_skipped:', msg.reason);
+          break;
+        case 'done':
+          log('session done:', msg);
+          setStatus('✅ Session complete.', 'ok');
+          cleanup();
+          break;
+        case 'error':
+          appendError('Server error: ' + (msg.error || msg.message || 'unknown'));
+          err('server error:', msg);
+          setStatus('Server error — see panel below.', 'err');
+          cleanup();
+          break;
+        default:
+          warn('unknown message type:', msg.type, msg);
       }
     };
 
-    ws.onerror = () => { setStatus('WebSocket error.', 'err'); cleanup(); };
-    ws.onclose = () => { if (startBtn.disabled && stopBtn.disabled === false) { setStatus('Disconnected.', 'warn'); cleanup(); } };
+    ws.onerror = ev => {
+      err('WebSocket onerror:', ev);
+      appendError('WebSocket error (see browser console for details).');
+      setStatus('WebSocket error.', 'err');
+    };
+
+    ws.onclose = ev => {
+      log(`WebSocket closed · code=${ev.code} reason=${ev.reason || '(none)'} clean=${ev.wasClean}`);
+      if (sessionActive) {
+        if (!stopRequested) {
+          appendError(`WebSocket closed unexpectedly (code ${ev.code}).`);
+          setStatus('Disconnected.', 'warn');
+        }
+        cleanup();
+      }
+      setHealth('amber', 'Re-checking…');
+      checkHealth();
+    };
+  }
+
+  function getPlaybackCtx() {
+    if (!playbackCtx || playbackCtx.state === 'closed') {
+      playbackCtx = new (window.AudioContext || window.webkitAudioContext)();
+      nextPlaybackAt = 0;
+    }
+    if (playbackCtx.state === 'suspended') {
+      playbackCtx.resume().catch(e => warn('AudioContext resume failed:', e));
+    }
+    return playbackCtx;
+  }
+
+  function playPCM(samples, sampleRate, segId) {
+    try {
+      const ctx = getPlaybackCtx();
+      const buf = ctx.createBuffer(1, samples.length, sampleRate);
+      buf.getChannelData(0).set(samples);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      const startAt = Math.max(ctx.currentTime, nextPlaybackAt);
+      src.start(startAt);
+      nextPlaybackAt = startAt + buf.duration;
+      segmentCounter++;
+      log(`▶ playing audio segment #${segmentCounter} (seg_id=${segId}, dur=${buf.duration.toFixed(2)}s, sr=${sampleRate}Hz)`);
+      audioPhEl.textContent = `Played ${segmentCounter} segment(s) · last duration ${buf.duration.toFixed(2)}s`;
+      if (ctx.state === 'suspended') {
+        appendError('Browser blocked autoplay — click anywhere on the page, then try again.');
+      }
+    } catch (e) {
+      err('playPCM failed:', e);
+      appendError('Audio playback failed: ' + e.message);
+    }
   }
 
   function stop() {
+    log('Stop requested by user');
+    stopRequested = true;
     stopBtn.disabled = true;
-    setStatus('Stopping — waiting for result…');
+    setStatus('Stopping…');
     if (ws && ws.readyState === WebSocket.OPEN) {
-      try { ws.send(JSON.stringify({ type: 'end' })); } catch {}
+      try {
+        ws.send(JSON.stringify({ type: 'end' }));
+        log('→ sent {type:"end"}, waiting for done…');
+      } catch (e) {
+        err('failed sending end:', e);
+        cleanup();
+      }
     } else {
+      log('Session already disconnected');
       cleanup();
     }
   }
 
   function cleanup() {
+    sessionActive = false;
     try { processorNode && processorNode.disconnect(); } catch {}
     try { sourceNode && sourceNode.disconnect(); } catch {}
     try { audioCtx && audioCtx.close(); } catch {}
@@ -2032,26 +2217,8 @@ baAddRow();
     processorNode = sourceNode = audioCtx = mediaStream = null;
     const _ws = ws; ws = null;
     try { _ws && _ws.close(); } catch {}
-    startBtn.disabled = false;
+    startBtn.disabled = !healthOk;
     stopBtn.disabled = true;
-  }
-
-  function float32ToWav(samples, sampleRate) {
-    const buf = new ArrayBuffer(44 + samples.length * 2);
-    const view = new DataView(buf);
-    const write = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
-    write(0, 'RIFF'); view.setUint32(4, 36 + samples.length * 2, true);
-    write(8, 'WAVE'); write(12, 'fmt '); view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true); view.setUint16(22, 1, true);
-    view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true);
-    view.setUint16(32, 2, true); view.setUint16(34, 16, true);
-    write(36, 'data'); view.setUint32(40, samples.length * 2, true);
-    let o = 44;
-    for (let i = 0; i < samples.length; i++, o += 2) {
-      const s = Math.max(-1, Math.min(1, samples[i]));
-      view.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-    }
-    return buf;
   }
 
   startBtn.addEventListener('click', start);
