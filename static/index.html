@@ -1987,7 +1987,7 @@ baAddRow();
       let msg;
       try { msg = JSON.parse(e.data); } catch { return; }
 
-      if (msg.type === 'error') { setStatus('Server error: ' + msg.message, 'err'); cleanup(); return; }
+      if (msg.type === 'error') { setStatus('Server error: ' + (msg.error || msg.message || 'unknown'), 'err'); cleanup(); return; }
       if (msg.type === 'ready') { setStatus('🔴 Recording — speak now…', 'ok'); return; }
       if (msg.type === 'final' && msg.text) { transcriptEl.textContent = msg.text; setStatus('Translating…'); return; }
       if (msg.type === 'translation' && msg.text) { translationEl.textContent = msg.text; setStatus('Synthesising speech…'); return; }
