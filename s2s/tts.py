@@ -124,12 +124,32 @@ class ChatterboxTurboBackend:
             return np.zeros(0, dtype=np.float32)
         self._ensure_loaded()
         kwargs = {}
-        if self._reference_voice:
+        # Re-check on every call: an operator may have provisioned the
+        # reference clip after process start (e.g. mounted a volume).
+        if self._reference_voice and Path(self._reference_voice).is_file():
             kwargs["audio_prompt_path"] = self._reference_voice
-        # Returns a torch.Tensor shaped [1, T] (mono) at self.sample_rate.
+        elif self._reference_voice:
+            logger.warning(
+                "Reference voice %s missing at synth time — using default voice",
+                self._reference_voice,
+            )
+
         with self._tts_lock():
-            wav = self._model.generate(text, **kwargs)
-        # Squeeze + cast to numpy float32 for direct PCM streaming.
+            try:
+                wav = self._model.generate(text, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                # Most common failure: malformed/short reference clip. Retry
+                # once without the prompt rather than failing the whole
+                # /ws/s2s segment.
+                if "audio_prompt_path" in kwargs:
+                    logger.warning(
+                        "Chatterbox generate() failed with reference clip "
+                        "(%s: %s) — retrying with default voice",
+                        type(exc).__name__, exc,
+                    )
+                    wav = self._model.generate(text)
+                else:
+                    raise
         try:
             arr = wav.detach().to("cpu").numpy()
         except Exception:  # noqa: BLE001

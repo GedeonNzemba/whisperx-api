@@ -1,0 +1,80 @@
+Your speech‑to‑speech endpoint is still failing with a PyTorch‑2.6
+`weights_only` error, this time for `omegaconf.base.ContainerMetadata`.
+The previous `add_safe_globals` fix only added `ListConfig` and `DictConfig`,
+but model checkpoints from whisperx, pyannote.audio, and lightning also
+contain other omegaconf and pyannote types that must be allow‑listed.
+
+**Root cause:** PyTorch ≥ 2.6 defaults `torch.load(..., weights_only=True)`,
+which rejects any Python object not in the default safe globals list. The
+checkpoints you use contain at least the following types that need explicit
+allow‑listing:
+
+- `omegaconf.listconfig.ListConfig`
+- `omegaconf.dictconfig.DictConfig`
+- `omegaconf.base.ContainerMetadata`
+- `omegaconf.base.Metadata`
+- `omegaconf.nodes.AnyNode`
+- `torch.torch_version.TorchVersion`
+- `pyannote.audio.core.model.Introspection`
+- `pyannote.audio.core.task.Specifications`
+- `pyannote.audio.core.task.Problem`
+- `pyannote.audio.core.task.Resolution`
+
+**Your task:** Replace the current `add_safe_globals` block at the top of
+`server.py` with the comprehensive version below. The block must execute
+**before any model is loaded** — i.e. before `registry.load_whisper()`,
+before the lifespan handler calls `load_diarize()`, and before any TTS
+or translation model is created.
+
+## Required code block (place at the very top of `server.py`, right after all
+other imports):
+
+```python
+import torch.serialization
+from omegaconf.listconfig import ListConfig
+from omegaconf.dictconfig import DictConfig
+from omegaconf.base import ContainerMetadata, Metadata
+from omegaconf.nodes import AnyNode
+from pyannote.audio.core.model import Introspection
+from pyannote.audio.core.task import Specifications, Problem, Resolution
+from typing import Any
+from collections import defaultdict
+
+# Allowlist all types that appear in whisperx / pyannote / lightning
+# checkpoints but are rejected by PyTorch ≥ 2.6 weights_only=True default.
+torch.serialization.add_safe_globals([
+    ListConfig,
+    DictConfig,
+    ContainerMetadata,
+    Metadata,
+    AnyNode,
+    Any,
+    list,
+    defaultdict,
+    dict,
+    int,
+    torch.torch_version.TorchVersion,
+    Introspection,
+    Specifications,
+    Problem,
+    Resolution,
+])
+
+
+Additional requirements
+1. Keep the existing import torch.serialization and from omegaconf...
+lines that are currently in server.py, but delete the old, smaller
+add_safe_globals call. Replace it with the comprehensive block above.
+
+2. Do not modify any other part of server.py. The WebSocket handler,
+the pipeline logic, and all other endpoints must remain untouched.
+
+3. Verify that the server starts without a weights_only error and
+that the /ws/s2s endpoint can process a full utterance (STT → MT → TTS)
+without crashing.
+
+Deliverable
+Provide the updated server.py file with the new safe‑globals block
+inserted at the correct location.
+
+Now write the code.

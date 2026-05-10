@@ -1972,9 +1972,13 @@ baAddRow();
         return;
       }
       const j = await r.json();
-      if (j.s2s_enabled) {
-        setHealth('green', `Connected · ${j.s2s_tts_backend || 'tts'}`);
+      if (j.s2s_enabled && j.s2s_ready) {
+        setHealth('green', `Ready · ${j.s2s_tts_backend || 'tts'}`);
         log('health OK', j);
+      } else if (j.s2s_enabled && !j.s2s_ready) {
+        const reason = j.s2s_warmup_error ? ` (${j.s2s_warmup_error})` : ' (loading models…)';
+        setHealth('amber', 'S2S warming up' + reason);
+        warn('health: s2s not ready yet', j);
       } else {
         setHealth('amber', 'S2S disabled on server');
         warn('health: s2s disabled', j);
@@ -2118,6 +2122,10 @@ baAddRow();
         case 'audio_skipped':
           appendError(`TTS skipped for segment #${msg.segment_id}: ${msg.reason}`);
           warn('audio_skipped:', msg.reason);
+          break;
+        case 'heartbeat':
+          // Server keepalive — defeats RunPod's idle WS proxy timeout.
+          log('💓 heartbeat', msg.ts);
           break;
         case 'done':
           log('session done:', msg);

@@ -870,19 +870,38 @@ async def lifespan(_: FastAPI):
             from s2s import tts as _s2s_tts
 
             logger.info("S2S enabled — warming up MT (NLLB) and TTS (%s)", _s2s_tts.TTS_BACKEND)
-            # Run warm-ups in background so server boot isn't blocked.
+            # Run warm-ups in background so server boot isn't blocked. Once
+            # BOTH succeed we flip _S2S_READY=True so /ws/s2s starts
+            # accepting clients. If either fails we surface the reason via
+            # /health and the WebSocket handler.
             def _s2s_warmup_async() -> None:
+                global _S2S_READY, _S2S_WARMUP_ERROR
+                errors: list[str] = []
                 try:
                     _s2s_translator.get_translator().warmup()
+                    logger.info("S2S translator warm-up OK")
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("S2S translator warm-up error: %s", exc)
+                    logger.exception("S2S translator warm-up failed")
+                    errors.append(f"translator: {type(exc).__name__}: {exc}")
                 try:
                     _s2s_tts.get_tts().warmup()
+                    logger.info("S2S TTS warm-up OK")
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("S2S TTS warm-up error: %s", exc)
+                    logger.exception("S2S TTS warm-up failed")
+                    errors.append(f"tts: {type(exc).__name__}: {exc}")
+                if errors:
+                    _S2S_WARMUP_ERROR = " | ".join(errors)
+                    _S2S_READY = False
+                    logger.error("S2S NOT READY: %s", _S2S_WARMUP_ERROR)
+                else:
+                    _S2S_WARMUP_ERROR = None
+                    _S2S_READY = True
+                    logger.info("S2S READY — translator + TTS loaded")
 
             threading.Thread(target=_s2s_warmup_async, daemon=True, name="s2s-warmup").start()
         except Exception as exc:  # noqa: BLE001
+            global _S2S_WARMUP_ERROR  # noqa: PLW0603
+            _S2S_WARMUP_ERROR = f"preload bootstrap: {exc}"
             logger.warning("S2S preload failed: %s", exc)
 
     yield
@@ -957,6 +976,13 @@ def _s2s_tts_import_error() -> str | None:
         return str(exc)
 
 
+# Set to True once both NLLB + TTS have completed their warm-up successfully
+# in the lifespan handler. /ws/s2s rejects connections until this is True so
+# the user gets a clear error rather than a silent stall.
+_S2S_READY: bool = False
+_S2S_WARMUP_ERROR: Optional[str] = None
+
+
 @app.get("/health")
 @app.post("/health")
 def health() -> Dict[str, Any]:
@@ -980,6 +1006,8 @@ def health() -> Dict[str, Any]:
         "pyannote_loaded": registry.diarize_pipeline is not None,
         "vibevoice_sidecar": _vibevoice_health_snapshot(),
         "s2s_enabled": S2S_ENABLED,
+        "s2s_ready": _S2S_READY,
+        "s2s_warmup_error": _S2S_WARMUP_ERROR,
         "s2s_tts_backend": (os.environ.get("TTS_BACKEND", "chatterbox-turbo") if S2S_ENABLED else None),
         "s2s_tts_error": _s2s_tts_import_error() if S2S_ENABLED else None,
         "diarization_error": registry.diarization_error,
@@ -4271,29 +4299,50 @@ async def _s2s_translate_and_speak(
     """Translate a finalised STT segment and stream synthesised audio back.
 
     Runs as a background asyncio task so STT chunking is never blocked by
-    MT or TTS latency. CPU/GPU work is dispatched to a thread pool.
+    MT or TTS latency. The full MT + TTS chain runs on a worker thread via
+    ``asyncio.to_thread`` so any exception is captured here, logged with a
+    full traceback, and reported back to the browser as a JSON ``error``
+    message instead of bringing down the WebSocket.
     """
-    from s2s import translator as s2s_translator
-    from s2s import tts as s2s_tts
+    seg_id = int(seg.get("segment_id", 0))
+
+    # Guardrail: skip empty/whitespace segments BEFORE touching any model.
+    text = (seg.get("text") or "").strip()
+    if not text:
+        logger.debug("s2s: skipping empty segment_id=%s", seg_id)
+        return
 
     try:
-        text = (seg.get("text") or "").strip()
-        if not text:
-            return
-        seg_id = int(seg.get("segment_id", 0))
+        from s2s import translator as s2s_translator
+        from s2s import tts as s2s_tts
 
-        loop = asyncio.get_running_loop()
         translator = s2s_translator.get_translator()
         tts = s2s_tts.get_tts()
 
-        # 1) Translate (off-loop; ~50-200 ms on RTX 4090).
-        translated = await loop.run_in_executor(
-            None,
-            lambda: translator.translate(
+        # English-only TTS (Chatterbox) cannot synthesise non-English
+        # targets; decide up-front whether we will actually speak.
+        if tts.language == "en" and target_lang.lower() != "en":
+            audio_lang_supported = False
+        else:
+            audio_lang_supported = True
+
+        def _do_translate_and_synthesise() -> tuple[str, Optional[np.ndarray], int]:
+            """Runs in a worker thread. Returns (translated, audio_or_None, sample_rate)."""
+            translated_local = translator.translate(
                 text, source_lang=source_lang, target_lang=target_lang
-            ),
-        )
+            )
+            if not translated_local:
+                return "", None, 0
+            if not audio_lang_supported:
+                return translated_local, None, 0
+            audio_local = tts.synthesize(translated_local)
+            sr_local = int(getattr(tts, "sample_rate", 24_000))
+            return translated_local, audio_local, sr_local
+
+        translated, audio, sr = await asyncio.to_thread(_do_translate_and_synthesise)
+
         if not translated:
+            logger.debug("s2s: translator returned empty for seg %s", seg_id)
             return
 
         await ws.send_json({
@@ -4304,17 +4353,6 @@ async def _s2s_translate_and_speak(
             "source_lang": source_lang,
             "target_lang": target_lang,
         })
-
-        # 2) Synthesise (off-loop; <300 ms TTFA on Chatterbox-Turbo).
-        # Phase 1 ships English-only TTS, so for non-English targets we
-        # *announce* the translation but do not synthesise audio. The
-        # client can fall back to its OS TTS until Qwen3-TTS lands.
-        if tts.language != "en" and target_lang.lower() != "en":
-            audio_lang_supported = True
-        elif tts.language == "en" and target_lang.lower() != "en":
-            audio_lang_supported = False
-        else:
-            audio_lang_supported = True
 
         if not audio_lang_supported:
             await ws.send_json({
@@ -4329,11 +4367,14 @@ async def _s2s_translate_and_speak(
             })
             return
 
-        audio = await loop.run_in_executor(None, lambda: tts.synthesize(translated))
         if audio is None or audio.size == 0:
+            await ws.send_json({
+                "type": "audio_skipped",
+                "segment_id": seg_id,
+                "reason": "TTS produced empty audio",
+            })
             return
 
-        sr = int(getattr(tts, "sample_rate", 24_000))
         duration_s = float(audio.shape[-1]) / float(sr)
         await ws.send_json({
             "type": "audio",
@@ -4341,21 +4382,22 @@ async def _s2s_translate_and_speak(
             "sample_rate": sr,
             "duration_s": round(duration_s, 4),
         })
-        # Send raw float32 PCM (matches /ws/stt input format on the
-        # other direction). Client should treat this as a 24 kHz mono
-        # float32 array for direct playback via WebAudio.
         await ws.send_bytes(np.ascontiguousarray(audio, dtype=np.float32).tobytes())
 
     except Exception as exc:  # noqa: BLE001
-        logger.exception("s2s translate/speak failed for segment %s", seg.get("segment_id"))
+        # Full traceback to logs, brief JSON to client. Never raise.
+        logger.exception(
+            "s2s pipeline failed for segment %s (text=%r): %s",
+            seg_id, text[:80], exc,
+        )
         try:
             await ws.send_json({
                 "type": "error",
                 "stage": "s2s",
-                "segment_id": seg.get("segment_id"),
-                "error": str(exc),
+                "segment_id": seg_id,
+                "error": f"{type(exc).__name__}: {exc}",
             })
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
 
@@ -4400,6 +4442,22 @@ async def websocket_s2s(ws: WebSocket) -> None:
         await ws.close()
         return
 
+    # Reject if the warmup thread hasn't finished (or failed). Without this
+    # the first segment would block for ~10-30 s while NLLB / Chatterbox
+    # weights load, which RunPod's proxy interprets as an idle WebSocket
+    # and kills with code 1011.
+    if not _S2S_READY:
+        await ws.send_json({
+            "type": "error",
+            "error": (
+                "S2S models not yet loaded. "
+                + (f"Warm-up error: {_S2S_WARMUP_ERROR}." if _S2S_WARMUP_ERROR
+                   else "Try again in ~30 s.")
+            ),
+        })
+        await ws.close()
+        return
+
     session: Optional[StreamingSession] = None
     process_task: Optional[asyncio.Task] = None
     pending_s2s_tasks: List[asyncio.Task] = []
@@ -4438,6 +4496,22 @@ async def websocket_s2s(ws: WebSocket) -> None:
                     logger.exception("S2S segment dispatch error")
         except asyncio.CancelledError:
             pass
+
+    async def heartbeat() -> None:
+        """Send a tiny JSON ping every 20 s so the RunPod proxy doesn't kill
+        the WebSocket as idle (proxy default is ~60-90 s). The browser
+        client just logs and ignores the heartbeat."""
+        try:
+            while True:
+                await asyncio.sleep(20.0)
+                try:
+                    await ws.send_json({"type": "heartbeat", "ts": time.time()})
+                except Exception:  # noqa: BLE001
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    heartbeat_task: Optional[asyncio.Task] = asyncio.create_task(heartbeat())
 
     try:
         while True:
@@ -4564,6 +4638,12 @@ async def websocket_s2s(ws: WebSocket) -> None:
             process_task.cancel()
             try:
                 await process_task
+            except Exception:
+                pass
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
             except Exception:
                 pass
         for t in pending_s2s_tasks:
