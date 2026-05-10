@@ -1,0 +1,76 @@
+## ✍️ High‑level prompt for the AI
+
+```
+We have a working `/ws/s2s` endpoint that opens successfully, but the
+WebSocket closes with code 1011 (internal error) as soon as a
+transcription segment is committed. The server logs show no tracebacks
+at all — the crash is silent inside the `_s2s_translate_and_speak`
+function.
+
+The browser console confirms:
+  - WebSocket opens, `ready` message is received.
+  - Microphone is acquired and streaming at 16 kHz.
+  - Heartbeats are flowing.
+  - Then the connection closes with code 1011 after ~35 seconds.
+
+Server logs show only health checks, no errors.
+
+## Required fixes (three independent changes)
+
+### 1. Harden `_s2s_translate_and_speak` with a full try/except
+In `server.py`, wrap the **entire body** of `_s2s_translate_and_speak`
+in a `try: ... except Exception: ...` block that:
+  - Logs the full traceback using `logger.exception("s2s segment failed")`.
+  - Sends a JSON error message to the client:
+    `{"type":"error","stage":"s2s","segment_id":<id>,"error":"<string>"}`
+  - Does NOT re‑raise. The WebSocket must stay open.
+
+### 2. Make the TTS reference clip optional in `s2s/tts.py`
+Find the `synthesize(text)` method in `s2s/tts.py`. It likely calls:
+```python
+model.generate(text, audio_prompt_path=REF_CLIP)
+```
+If `REF_CLIP` does not exist on disk, the model crashes.
+Change the logic to:
+```python
+import os
+ref = REF_CLIP if os.path.isfile(REF_CLIP) else None
+wav = model.generate(text, audio_prompt_path=ref) if ref else model.generate(text)
+```
+Also bundle a tiny reference clip (10 seconds of clean speech, any
+speaker, saved as `static/ref_speaker.wav`) in the Docker image so the
+clip always exists. If even the bundled clip is missing, fall back to
+synthesising without a reference — Chatterbox‑Turbo will use a default
+voice.
+
+### 3. Pre‑warm the NLLB‑200 translator AND TTS on startup
+In the lifespan handler (or `@app.on_event("startup")`), after
+Whisper is loaded, call `translator.get_translator().warmup()` and
+`tts.get_tts().warmup()` **inside a background thread** so the server
+starts without delay. If warmup fails, set a module‑level flag
+`_s2s_available = False` and have `/ws/s2s` reject connections with a
+clear error message. This prevents lazy‑loading crashes from occurring
+mid‑session.
+
+### 4. Add a `/health` check for the S2S models
+Extend the `/health` endpoint to include:
+```json
+"s2s_translator_loaded": true/false,
+"s2s_tts_loaded": true/false,
+"s2s_tts_error": "<error string or null>"
+```
+This lets the browser UI (and you) verify the models are ready before
+attempting a session.
+
+## Deliverables
+Update `server.py` and `s2s/tts.py` with the changes above. After
+these fixes:
+  - The browser UI's health badge shows green only when both models
+    are loaded.
+  - Every S2S error is sent to the browser as a visible JSON message
+    AND logged on the server with a full traceback.
+  - The WebSocket never closes with 1011 unless the pod itself is
+    out of memory.
+
+Write production‑grade Python code. Keep all existing endpoints
+unchanged.

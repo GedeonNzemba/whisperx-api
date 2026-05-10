@@ -41,4 +41,12 @@ if [ "${DIARIZATION_BACKEND:-auto}" = "vibevoice" ]; then
 fi
 
 echo "[start.sh] Starting uvicorn on ${HOST:-0.0.0.0}:${PORT:-8000}"
-exec uvicorn server:app --host "${HOST:-0.0.0.0}" --port "${PORT:-8000}"
+# WS ping/timeout extended so /ws/s2s survives the GPU-bound chunks
+# of MT + TTS that briefly stall pong replies. Default uvicorn is
+# 20/20 which yields code=1011 keepalive-ping-timeout under load.
+exec uvicorn server:app \
+    --host "${HOST:-0.0.0.0}" \
+    --port "${PORT:-8000}" \
+    --ws-ping-interval "${WS_PING_INTERVAL:-30}" \
+    --ws-ping-timeout "${WS_PING_TIMEOUT:-120}" \
+    --timeout-keep-alive "${TIMEOUT_KEEP_ALIVE:-120}"
