@@ -47,6 +47,6 @@ echo "[start.sh] Starting uvicorn on ${HOST:-0.0.0.0}:${PORT:-8000}"
 exec uvicorn server:app \
     --host "${HOST:-0.0.0.0}" \
     --port "${PORT:-8000}" \
-    --ws-ping-interval "${WS_PING_INTERVAL:-30}" \
-    --ws-ping-timeout "${WS_PING_TIMEOUT:-120}" \
-    --timeout-keep-alive "${TIMEOUT_KEEP_ALIVE:-120}"
+    --ws-ping-interval "${WS_PING_INTERVAL:-60}" \
+    --ws-ping-timeout "${WS_PING_TIMEOUT:-300}" \
+    --timeout-keep-alive "${TIMEOUT_KEEP_ALIVE:-300}"
