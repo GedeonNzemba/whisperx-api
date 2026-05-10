@@ -2033,8 +2033,26 @@ baAddRow();
       ws.send(JSON.stringify(startMsg));
 
       try {
-        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        log('mic acquired');
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            channelCount: 1,
+          },
+        });
+        log('mic acquired (raw: AEC/NS/AGC disabled)');
+        try {
+          const tr = mediaStream.getAudioTracks()[0];
+          const s = tr && tr.getSettings ? tr.getSettings() : {};
+          log('mic track settings:', JSON.stringify({
+            sampleRate: s.sampleRate, channelCount: s.channelCount,
+            echoCancellation: s.echoCancellation,
+            noiseSuppression: s.noiseSuppression,
+            autoGainControl: s.autoGainControl,
+            deviceId: s.deviceId,
+          }));
+        } catch {}
       } catch (e) {
         appendError('Microphone error: ' + e.message);
         err('getUserMedia failed:', e);
@@ -2057,10 +2075,30 @@ baAddRow();
           `)
         );
         processorNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
+        let __micFrames = 0, __micPeak = 0, __micSumSq = 0, __micN = 0;
         processorNode.port.onmessage = e => {
           if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data);
+          try {
+            const f = new Float32Array(e.data);
+            for (let i = 0; i < f.length; i++) {
+              const v = f[i];
+              __micSumSq += v * v;
+              const a = v < 0 ? -v : v;
+              if (a > __micPeak) __micPeak = a;
+            }
+            __micN += f.length;
+            __micFrames++;
+            if (__micFrames % 40 === 0) {
+              const rms = Math.sqrt(__micSumSq / Math.max(1, __micN));
+              log(`mic stats: rms=${rms.toExponential(2)} peak=${__micPeak.toExponential(2)} samples=${__micN}`);
+              __micPeak = 0; __micSumSq = 0; __micN = 0;
+            }
+          } catch {}
         };
         sourceNode.connect(processorNode);
+        const __sink = audioCtx.createGain();
+        __sink.gain.value = 0;
+        processorNode.connect(__sink).connect(audioCtx.destination);
         log('mic pipeline running @ 16 kHz');
       } catch (e) {
         appendError('Audio pipeline error: ' + e.message);
