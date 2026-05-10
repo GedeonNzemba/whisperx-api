@@ -3907,7 +3907,7 @@ class StreamingSession:
         # filler tokens ("Thank you.", "I'm I'm", ".") so skip them entirely.
         # The committed_samples advance above is kept (no rollback) — the
         # silence is simply dropped from the transcript.
-        if not self._chunk_has_speech(chunk_audio):
+        if not await asyncio.to_thread(self._chunk_has_speech, chunk_audio):
             logger.info(
                 "Streaming session %s: chunk [%.2f-%.2f] skipped (no speech detected)",
                 self.session_id, offset_s, offset_s + chunk_audio.size / self.SAMPLE_RATE,
