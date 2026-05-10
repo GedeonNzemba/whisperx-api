@@ -3648,7 +3648,13 @@ class StreamingSession:
         # Brief lock to check how much unprocessed audio exists.
         async with self.lock:
             unprocessed = len(self.buffer) - self.committed_samples
-        if unprocessed < int(self.CHUNK_DURATION_S * self.SAMPLE_RATE):
+        needed = int(self.CHUNK_DURATION_S * self.SAMPLE_RATE)
+        if unprocessed < needed:
+            if unprocessed > 0:
+                logger.info(
+                    "Streaming session %s: buffered %.2fs / %.2fs needed (waiting)",
+                    self.session_id, unprocessed / self.SAMPLE_RATE, self.CHUNK_DURATION_S,
+                )
             return
         await self._commit_one_chunk(force=False)
 
@@ -3701,22 +3707,28 @@ class StreamingSession:
         VAD is unavailable or errors, fall back to the energy decision.
         """
         if audio.size < int(0.3 * self.SAMPLE_RATE):
+            logger.info("Streaming session %s: chunk too short (%d samples), skipping", self.session_id, audio.size)
             return False
         try:
             rms = float(np.sqrt(np.mean(np.square(audio.astype(np.float64)))))
         except Exception:
             rms = 0.0
         # ~ -50 dBFS — anything below this is room tone / dead silence.
+        logger.info("Streaming session %s: chunk RMS=%.5f (threshold=0.003)", self.session_id, rms)
         if rms < 0.003:
+            logger.info("Streaming session %s: chunk rejected by RMS gate (too quiet)", self.session_id)
             return False
         vad_fn = registry.try_load_silero_vad()
         if vad_fn is None:
+            logger.info("Streaming session %s: Silero VAD unavailable, passing chunk (energy only)", self.session_id)
             return True
         try:
             ts = vad_fn(audio, min_ms=300)
-            return bool(ts) and len(ts) > 0
+            has_speech = bool(ts) and len(ts) > 0
+            logger.info("Streaming session %s: Silero VAD result=%s (segments=%d)", self.session_id, has_speech, len(ts) if ts else 0)
+            return has_speech
         except Exception as exc:  # noqa: BLE001
-            logger.debug("Silero VAD call failed (falling back to energy): %s", exc)
+            logger.info("Streaming session %s: Silero VAD call failed (falling back to energy): %s", self.session_id, exc)
             return True
 
     # Words for which immediate repetition is intentional and should be kept.
@@ -3896,8 +3908,8 @@ class StreamingSession:
         # The committed_samples advance above is kept (no rollback) — the
         # silence is simply dropped from the transcript.
         if not self._chunk_has_speech(chunk_audio):
-            logger.debug(
-                "Streaming session %s: chunk [%.2f-%.2f] skipped (no speech)",
+            logger.info(
+                "Streaming session %s: chunk [%.2f-%.2f] skipped (no speech detected)",
                 self.session_id, offset_s, offset_s + chunk_audio.size / self.SAMPLE_RATE,
             )
             async with self.lock:
@@ -4621,7 +4633,11 @@ async def websocket_s2s(ws: WebSocket) -> None:
                     await ws.send_json({"type": "error", "error": f"invalid PCM frame: {exc}"})
                     continue
                 async with session.lock:
+                    prev_len = len(session.buffer)
                     session.add_audio(pcm)
+                    new_len = len(session.buffer)
+                if prev_len == 0 and new_len > 0:
+                    logger.info("Streaming session %s: first audio frame received (%d samples)", session.session_id, new_len)
 
     except WebSocketDisconnect:
         pass
