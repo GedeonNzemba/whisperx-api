@@ -34,11 +34,19 @@ RUN pip install torch==2.6.0 torchaudio==2.6.0 \
 RUN pip install -r /app/requirements.txt && \
     pip install chatterbox-tts
 
-# cuDNN 8 is required by CTranslate2/WhisperX but missing from the CUDA 12.4 runtime
-# base image. Install via pip and register with ldconfig so it is found system-wide
-# regardless of LD_LIBRARY_PATH (survives container restarts and sub-process launches).
+# We need TWO cuDNN versions simultaneously:
+#   cuDNN 8 (libcudnn_ops_infer.so.8) — required by CTranslate2/WhisperX
+#   cuDNN 9 (libcudnn.so.9)           — required by PyTorch 2.6
+#
+# Strategy: install cuDNN 8 first, copy its .so files to /usr/local/lib/cudnn8/,
+# then reinstall cuDNN 9 (which torch already declared as a dep). Register both
+# directories with ldconfig so the system linker finds both at runtime.
 RUN pip install nvidia-cudnn-cu12==8.9.7.29 && \
-    echo "/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib" \
+    mkdir -p /usr/local/lib/cudnn8 && \
+    cp /usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib/libcudnn*.so* \
+       /usr/local/lib/cudnn8/ && \
+    pip install nvidia-cudnn-cu12==9.1.0.70 && \
+    printf '/usr/local/lib/cudnn8\n/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib\n' \
         > /etc/ld.so.conf.d/zzz-nvidia-cudnn.conf && \
     ldconfig
 
@@ -70,8 +78,9 @@ RUN ln -sf /usr/bin/python3.10 /usr/local/bin/python && \
 # Copy installed Python packages from builder.
 COPY --from=builder /usr/local/lib/python3.10/dist-packages /usr/local/lib/python3.10/dist-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
-
-# Register cuDNN 8 with the runtime linker (matches what builder baked in).
+# cuDNN 8 .so files saved separately so both cuDNN 8 and 9 are available.
+COPY --from=builder /usr/local/lib/cudnn8 /usr/local/lib/cudnn8
+# Register both cuDNN versions with the runtime linker.
 COPY --from=builder /etc/ld.so.conf.d/zzz-nvidia-cudnn.conf /etc/ld.so.conf.d/zzz-nvidia-cudnn.conf
 RUN ldconfig
 

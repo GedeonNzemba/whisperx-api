@@ -17,21 +17,24 @@ fi
 # ── cuDNN: belt-and-suspenders LD_LIBRARY_PATH ────────────────────────────────
 # ldconfig baked into the image is the primary fix; this covers edge cases
 # where the linker cache is stale or a sub-process resets the environment.
-_CUDNN_LIB="/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib"
-if [ -d "$_CUDNN_LIB" ]; then
-    export LD_LIBRARY_PATH="${_CUDNN_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-fi
+# Include both cuDNN 8 (for CTranslate2) and cuDNN 9 (for PyTorch).
+for _dir in /usr/local/lib/cudnn8 /usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib; do
+    if [ -d "$_dir" ]; then
+        export LD_LIBRARY_PATH="${_dir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+done
 
 # Auto-pull latest code from GitHub on every pod start (set GIT_REPO env var).
+# Uses curl (always available) since git is not installed in the runtime image.
 if [ -n "${GIT_REPO:-}" ]; then
     echo "[start.sh] Pulling latest code from $GIT_REPO"
-    if [ -d /app/.git ]; then
-        git -C /app pull origin "${GIT_BRANCH:-main}" 2>&1 || echo "[start.sh] git pull failed — using baked code"
-    else
-        git clone --depth=1 --branch "${GIT_BRANCH:-main}" "$GIT_REPO" /tmp/repo 2>&1 && \
-        cp -r /tmp/repo/. /app/ && rm -rf /tmp/repo && \
-        echo "[start.sh] Cloned fresh code from GitHub"
-    fi
+    _BRANCH="${GIT_BRANCH:-main}"
+    _RAW_BASE="https://raw.githubusercontent.com/$(echo "$GIT_REPO" | sed 's|https://github.com/||')"
+    for _file in server.py static/index.html s2s/translator.py s2s/tts.py start.sh; do
+        curl -fsSL "${_RAW_BASE}/${_BRANCH}/${_file}" -o "/app/${_file}" 2>/dev/null && \
+            echo "[start.sh] Updated ${_file}" || \
+            echo "[start.sh] Skipped ${_file} (not found or no network)"
+    done
 fi
 
 VENV_DIR="${VIBEVOICE_VENV_DIR:-/models/vibevoice-venv}"
