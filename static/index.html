@@ -809,6 +809,37 @@
           </select>
         </div>
 
+        <!-- ── Mic & Speaker Test ──────────────────────────────────── -->
+        <div style="margin-top:16px;padding:12px;background:#0c1017;border:1px solid var(--border);border-radius:8px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+            <strong style="font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;">🔬 Mic &amp; Speaker Test</strong>
+            <button type="button" id="s2s-refresh-devices" style="font-size:11px;padding:3px 10px;background:transparent;border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer;">🔄 Refresh devices</button>
+          </div>
+          <div class="field" style="margin-bottom:8px;">
+            <label style="font-size:11px;">Microphone</label>
+            <select id="s2s-mic-select" style="font-size:12px;"><option>— click Refresh to enumerate —</option></select>
+          </div>
+          <div class="field" style="margin-bottom:10px;">
+            <label style="font-size:11px;">Speaker / Output</label>
+            <select id="s2s-spk-select" style="font-size:12px;"><option>— click Refresh to enumerate —</option></select>
+          </div>
+          <div style="margin-bottom:8px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+              <span style="font-size:11px;color:var(--muted);">Mic level</span>
+              <span id="s2s-rms-value" style="font-size:11px;font-family:ui-monospace,Menlo,monospace;color:var(--accent-2);">–</span>
+            </div>
+            <div style="height:8px;background:#1a1e28;border-radius:4px;overflow:hidden;border:1px solid var(--border);">
+              <div id="s2s-level-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#22c55e 0%,#eab308 65%,#ef4444 100%);border-radius:4px;transition:width 80ms linear;"></div>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button type="button" id="s2s-test-mic" style="font-size:12px;padding:5px 12px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--text);cursor:pointer;">🎤 Test mic (5 s)</button>
+            <button type="button" id="s2s-test-speaker" style="font-size:12px;padding:5px 12px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--text);cursor:pointer;">🔊 Test speaker</button>
+          </div>
+          <div id="s2s-sample-rate-info" style="margin-top:8px;font-size:11px;color:var(--muted);"></div>
+        </div>
+        <!-- ── End Mic & Speaker Test ─────────────────────────────── -->
+
         <div class="row" style="gap:10px;margin-top:16px;align-items:center;">
           <button class="primary" id="s2s-start" type="button" disabled>🎤 Start</button>
           <button class="primary" id="s2s-stop" type="button" disabled style="background:var(--err);">⏹ Stop</button>
@@ -1911,18 +1942,148 @@ baAddRow();
 })();
 
 (function s2sPanel() {
-  const startBtn      = document.getElementById('s2s-start');
-  const stopBtn       = document.getElementById('s2s-stop');
-  const statusEl      = document.getElementById('s2s-status');
-  const transcriptEl  = document.getElementById('s2s-transcript');
-  const translationEl = document.getElementById('s2s-translation');
-  const audioEl       = document.getElementById('s2s-audio');
-  const audioPhEl     = document.getElementById('s2s-audio-placeholder');
-  const srcLangEl     = document.getElementById('s2s-src-lang');
-  const tgtLangEl     = document.getElementById('s2s-tgt-lang');
-  const errorsEl      = document.getElementById('s2s-errors');
-  const healthDotEl   = document.getElementById('s2s-health-dot');
-  const healthTextEl  = document.getElementById('s2s-health-text');
+  const startBtn       = document.getElementById('s2s-start');
+  const stopBtn        = document.getElementById('s2s-stop');
+  const statusEl       = document.getElementById('s2s-status');
+  const transcriptEl   = document.getElementById('s2s-transcript');
+  const translationEl  = document.getElementById('s2s-translation');
+  const audioEl        = document.getElementById('s2s-audio');
+  const audioPhEl      = document.getElementById('s2s-audio-placeholder');
+  const srcLangEl      = document.getElementById('s2s-src-lang');
+  const tgtLangEl      = document.getElementById('s2s-tgt-lang');
+  const errorsEl       = document.getElementById('s2s-errors');
+  const healthDotEl    = document.getElementById('s2s-health-dot');
+  const healthTextEl   = document.getElementById('s2s-health-text');
+  // Test panel elements
+  const micSelectEl    = document.getElementById('s2s-mic-select');
+  const spkSelectEl    = document.getElementById('s2s-spk-select');
+  const refreshDevBtn  = document.getElementById('s2s-refresh-devices');
+  const levelBarEl     = document.getElementById('s2s-level-bar');
+  const rmsValueEl     = document.getElementById('s2s-rms-value');
+  const testMicBtn     = document.getElementById('s2s-test-mic');
+  const testSpkBtn     = document.getElementById('s2s-test-speaker');
+  const srInfoEl       = document.getElementById('s2s-sample-rate-info');
+
+  // ── Device enumeration ──────────────────────────────────────────────────
+  async function refreshDevices() {
+    try {
+      // Request mic access first so device labels are populated (not just IDs).
+      await navigator.mediaDevices.getUserMedia({ audio: true })
+        .then(s => s.getTracks().forEach(t => t.stop()))
+        .catch(() => {});
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const mics = devices.filter(d => d.kind === 'audioinput');
+      const spks = devices.filter(d => d.kind === 'audiooutput');
+      micSelectEl.innerHTML = mics.length
+        ? mics.map((d, i) =>
+            `<option value="${d.deviceId}">${d.label || 'Microphone ' + (i + 1)}</option>`
+          ).join('')
+        : '<option>No microphones found</option>';
+      spkSelectEl.innerHTML = spks.length
+        ? spks.map((d, i) =>
+            `<option value="${d.deviceId}">${d.label || 'Speaker ' + (i + 1)}</option>`
+          ).join('')
+        : '<option>No speakers found (default system output will be used)</option>';
+      log('Devices refreshed:', mics.length, 'mics,', spks.length, 'speakers');
+    } catch(e) {
+      warn('Device enumeration failed:', e);
+      appendError('Device enumeration failed: ' + e.message);
+    }
+  }
+  refreshDevBtn.addEventListener('click', refreshDevices);
+
+  // ── Mic test (5 s live level meter) ─────────────────────────────────────
+  let _micTestRunning = false;
+  testMicBtn.addEventListener('click', async () => {
+    if (_micTestRunning) return;
+    _micTestRunning = true;
+    testMicBtn.textContent = '⏳ Testing…';
+    testMicBtn.disabled = true;
+    levelBarEl.style.width = '0%';
+    rmsValueEl.textContent = '–';
+    srInfoEl.textContent = '';
+    try {
+      const deviceId = micSelectEl.value;
+      const constraints = {
+        audio: {
+          ...(deviceId && deviceId !== '' ? { deviceId: { exact: deviceId } } : {}),
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        }
+      };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      const ctx = new AudioContext({ sampleRate: 16000 });
+      const actualRate = ctx.sampleRate;
+      if (actualRate !== 16000) {
+        srInfoEl.textContent = `⚠️ Capture rate: ${actualRate} Hz (expected 16000 Hz). Browser resamples automatically — quality may be slightly reduced.`;
+        srInfoEl.style.color = 'var(--warn)';
+      } else {
+        srInfoEl.textContent = `✅ Capture rate: ${actualRate} Hz — perfect for WhisperX.`;
+        srInfoEl.style.color = 'var(--accent-2)';
+      }
+      const src = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      src.connect(analyser);
+      const data = new Float32Array(analyser.fftSize);
+      const TOTAL_FRAMES = 50; // ~5 s at 100 ms
+      let frame = 0;
+      const interval = setInterval(() => {
+        analyser.getFloatTimeDomainData(data);
+        let sumSq = 0;
+        for (let i = 0; i < data.length; i++) sumSq += data[i] * data[i];
+        const rms = Math.sqrt(sumSq / data.length);
+        const pct = Math.min(100, rms * 800);
+        levelBarEl.style.width = pct + '%';
+        rmsValueEl.textContent = rms.toExponential(2);
+        if (++frame >= TOTAL_FRAMES) {
+          clearInterval(interval);
+          stream.getTracks().forEach(t => t.stop());
+          ctx.close();
+          levelBarEl.style.width = '0%';
+          rmsValueEl.textContent = '–';
+          _micTestRunning = false;
+          testMicBtn.textContent = '🎤 Test mic (5 s)';
+          testMicBtn.disabled = false;
+        }
+      }, 100);
+      log('Mic test started — actual AudioContext rate:', actualRate, 'Hz');
+    } catch(e) {
+      warn('Mic test failed:', e);
+      appendError('Mic test failed: ' + e.message + '. Check browser permissions and macOS System Settings → Privacy → Microphone.');
+      _micTestRunning = false;
+      testMicBtn.textContent = '🎤 Test mic (5 s)';
+      testMicBtn.disabled = false;
+    }
+  });
+
+  // ── Speaker test (440 Hz beep) ───────────────────────────────────────────
+  testSpkBtn.addEventListener('click', () => {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      if (ctx.state === 'suspended') ctx.resume();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      // Route to specific output device if setSinkId is supported
+      if (spkSelectEl.value && ctx.setSinkId) {
+        ctx.setSinkId(spkSelectEl.value).catch(() => {});
+      }
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = 'sine';
+      osc.frequency.value = 440;
+      gain.gain.setValueAtTime(0.35, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 1.2);
+      osc.start(ctx.currentTime);
+      osc.stop(ctx.currentTime + 1.2);
+      osc.onended = () => ctx.close();
+      log('Speaker test: 440 Hz beep playing');
+    } catch(e) {
+      warn('Speaker test failed:', e);
+      appendError('Speaker test failed: ' + e.message);
+    }
+  });
 
   const TAG = '[s2s]';
   const ts  = () => new Date().toISOString().split('T')[1].replace('Z', '');
@@ -2009,6 +2170,17 @@ baAddRow();
     nextPlaybackAt = 0;
     setStatus('Connecting…');
 
+    // Prime the playback AudioContext NOW, while we're inside a user-gesture
+    // handler. Browsers (Chrome/Safari on macOS) block AudioContext.resume()
+    // when called outside a gesture, which silences the TTS output completely.
+    try {
+      const primeCtx = getPlaybackCtx();
+      await primeCtx.resume();
+      log('playback AudioContext primed, state:', primeCtx.state);
+    } catch(e) {
+      warn('Could not prime playback AudioContext:', e);
+    }
+
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${location.host}/ws/s2s`;
     log('opening WebSocket:', wsUrl);
@@ -2061,6 +2233,15 @@ baAddRow();
 
       try {
         audioCtx = new AudioContext({ sampleRate: 16000 });
+        // Verify the browser honored our 16 kHz request (macOS may not).
+        if (audioCtx.sampleRate !== 16000) {
+          appendError(`⚠️ AudioContext running at ${audioCtx.sampleRate} Hz instead of 16000 Hz. ` +
+            'Whisper still works but timestamps may drift slightly. ' +
+            'Try the "Test mic" button to diagnose.');
+          warn('AudioContext sample rate mismatch — got', audioCtx.sampleRate, 'Hz');
+        } else {
+          log('AudioContext sample rate confirmed: 16000 Hz ✅');
+        }
         sourceNode = audioCtx.createMediaStreamSource(mediaStream);
         await audioCtx.audioWorklet.addModule(
           'data:application/javascript,' + encodeURIComponent(`

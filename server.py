@@ -4048,6 +4048,10 @@ class StreamingSession:
         if not segments:
             return None
         detected_language = transcription.get("language") or self.language or "en"
+        # Persist the detected language so S2S uses the correct source_lang
+        # for NLLB translation on every subsequent chunk (not just the first).
+        if not self.language:
+            self.language = detected_language
 
         # Forced alignment for word-level timestamps
         words: List[Dict[str, Any]] = []
