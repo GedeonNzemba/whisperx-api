@@ -18,7 +18,8 @@ fi
 # ldconfig baked into the image is the primary fix; this covers edge cases
 # where the linker cache is stale or a sub-process resets the environment.
 # Include both cuDNN 8 (for CTranslate2) and cuDNN 9 (for PyTorch).
-for _dir in /usr/local/lib/cudnn8 /usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib; do
+# /models/cudnn8 is on the Network Volume — persisted cuDNN 8 libs survive image rebuilds.
+for _dir in /models/cudnn8 /usr/local/lib/cudnn8 /usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib; do
     if [ -d "$_dir" ]; then
         export LD_LIBRARY_PATH="${_dir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     fi
