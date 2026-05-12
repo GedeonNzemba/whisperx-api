@@ -29,7 +29,7 @@ done
 if [ -n "${GIT_REPO:-}" ]; then
     echo "[start.sh] Pulling latest code from $GIT_REPO"
     _BRANCH="${GIT_BRANCH:-main}"
-    _RAW_BASE="https://raw.githubusercontent.com/$(echo "$GIT_REPO" | sed 's|https://github.com/||')"
+    _RAW_BASE="https://raw.githubusercontent.com/$(echo "$GIT_REPO" | sed 's|https://github.com/||' | sed 's|\.git$||')"
     for _file in server.py static/index.html s2s/translator.py s2s/tts.py start.sh; do
         curl -fsSL "${_RAW_BASE}/${_BRANCH}/${_file}" -o "/app/${_file}" 2>/dev/null && \
             echo "[start.sh] Updated ${_file}" || \
