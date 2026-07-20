@@ -166,6 +166,17 @@ S2S_ENABLED = os.environ.get("S2S_ENABLED", "0").strip().lower() in {"1", "true"
 # Default target language for S2S sessions that don't specify one.
 S2S_TARGET_LANG_DEFAULT = os.environ.get("S2S_TARGET_LANG_DEFAULT", "fr").strip().lower() or "fr"
 
+# Streaming engine selection for /ws/stt and /ws/s2s:
+#   "localagreement" (default) → LocalAgreement-2 policy (streaming_asr.py,
+#       ported from ufal/whisper_streaming): sub-second partial hypotheses,
+#       ~2-3 s confirmed text, language-agnostic stability rule.
+#   "legacy" → previous 5-second-chunk StreamingSession (rollback safety).
+# The MLX backend (Apple dev) has no word_timestamps path, so it always uses
+# legacy regardless of this flag.
+STREAMING_ENGINE = os.environ.get("STREAMING_ENGINE", "localagreement").strip().lower()
+if STREAMING_ENGINE not in {"localagreement", "legacy"}:
+    STREAMING_ENGINE = "localagreement"
+
 # ASR backend selection: "auto" | "mlx" | "whisperx"
 #   auto     → MLX on Apple Silicon, whisperx everywhere else
 #   mlx      → force lightning-whisper-mlx (Apple Silicon only)
@@ -4164,6 +4175,258 @@ class StreamingSession:
         }
 
 
+class LocalAgreementStreamingSession:
+    """Streaming session backed by the LocalAgreement-2 engine (streaming_asr.py).
+
+    Drop-in replacement for StreamingSession (same attributes/methods the WS
+    handlers use), but with a fundamentally better latency profile:
+
+    * every ~1 s pass emits a ``{"type": "partial"}`` message with the current
+      unconfirmed hypothesis (sub-second-ish first feedback), and
+    * words confirmed by two consecutive passes are grouped into segments and
+      emitted as the existing ``{"type": "final"}`` messages (so /ws/s2s's MT+TTS
+      dispatch and all clients keep working unchanged).
+
+    Segment closing (for finals) happens at sentence-ending punctuation, a
+    ≥1 s inter-word pause, or a 15 s length cap — language-agnostic rules that
+    replace the old English-only dedup/hallucination heuristics.
+    """
+
+    SAMPLE_RATE = 16000
+    MIN_NEW_AUDIO_S = 1.0      # run a pass once this much new audio arrived
+    PAUSE_SPLIT_S = 1.0        # close segment on inter-word silence ≥ this
+    MAX_SEGMENT_S = 15.0       # hard cap per segment
+    # Sentence-final punctuation across scripts (Latin, CJK, Arabic, Devanagari…)
+    _SENT_END = tuple(".!?…。！？؟।")
+
+    def __init__(
+        self,
+        websocket: WebSocket,
+        language: Optional[str] = None,
+        initial_prompt: Optional[str] = None,
+    ) -> None:
+        from streaming_asr import OnlineASRProcessor  # local import; tiny module
+
+        self.ws = websocket
+        self.language = (language or "").strip().lower() or None
+        ip = (initial_prompt or "").strip()
+        self.initial_prompt: Optional[str] = ip if ip else DEFAULT_STREAM_INITIAL_PROMPT
+        self.session_id = uuid.uuid4().hex
+        self.segments: List[Dict[str, Any]] = []
+        self.next_segment_id = 0
+        self.lock = asyncio.Lock()
+        self.started_at = time.time()
+        self.stop_requested = False
+
+        whisper = registry.load_whisper()
+        fw_model = getattr(whisper, "model", None)  # raw faster_whisper.WhisperModel
+        if fw_model is None or not hasattr(fw_model, "transcribe"):
+            raise RuntimeError(
+                "LocalAgreement engine needs the faster-whisper backend "
+                "(EFFECTIVE_BACKEND=whisperx)."
+            )
+        self._proc = OnlineASRProcessor(
+            fw_model,
+            language=self.language,
+            buffer_trimming_sec=15.0,
+            initial_prompt=self.initial_prompt,
+            beam_size=int(os.environ.get("STREAM_BEAM_SIZE", "1")),
+        )
+        self._pending_new_s = 0.0          # new audio since last pass
+        self._open_words: List[Tuple[float, float, str]] = []  # committed, unsegmented
+        self._last_partial_text = ""
+        self._pass_running = False
+        logger.info(
+            "LocalAgreement session %s started (language=%s)",
+            self.session_id, self.language or "auto",
+        )
+
+    # ---- audio ingestion (called under self.lock) ------------------------
+
+    def add_audio(self, pcm: np.ndarray) -> None:
+        if pcm.size == 0:
+            return
+        self._proc.insert_audio_chunk(pcm.astype(np.float32, copy=False))
+        self._pending_new_s += pcm.size / self.SAMPLE_RATE
+
+    # ---- segment building ------------------------------------------------
+
+    def _close_segment(self) -> Optional[Dict[str, Any]]:
+        if not self._open_words:
+            return None
+        words = [
+            {"word": t.strip(), "start": round(a, 3), "end": round(b, 3)}
+            for a, b, t in self._open_words
+            if t.strip()
+        ]
+        self._open_words = []
+        if not words:
+            return None
+        text = " ".join(w["word"] for w in words).strip()
+        if not text:
+            return None
+        seg = {
+            "segment_id": self.next_segment_id,
+            "text": text,
+            "start": words[0]["start"],
+            "end": words[-1]["end"],
+            "words": words,
+        }
+        self.next_segment_id += 1
+        self.segments.append(seg)
+        return seg
+
+    def _maybe_close_on_rules(self) -> List[Dict[str, Any]]:
+        """Close the open segment on sentence end / pause / length. Returns
+        the list of segments closed in this call (0 or 1)."""
+        closed: List[Dict[str, Any]] = []
+        if not self._open_words:
+            return closed
+        last = self._open_words[-1]
+        dur = last[1] - self._open_words[0][0]
+        ends_sentence = last[2].strip().endswith(self._SENT_END)
+        if ends_sentence or dur >= self.MAX_SEGMENT_S:
+            seg = self._close_segment()
+            if seg:
+                closed.append(seg)
+        return closed
+
+    # ---- main driver (called by the periodic task) -----------------------
+
+    async def maybe_process(self) -> None:
+        async with self.lock:
+            if self._pass_running or self._pending_new_s < self.MIN_NEW_AUDIO_S:
+                return
+            self._pass_running = True
+            self._pending_new_s = 0.0
+        try:
+            committed, partial = await asyncio.to_thread(self._proc.process_iter)
+        except Exception:
+            logger.exception("LocalAgreement pass failed")
+            return
+        finally:
+            self._pass_running = False
+
+        to_send: List[Dict[str, Any]] = []
+        async with self.lock:
+            # Adopt per-pass language detection (mixed-language sessions).
+            if self._proc.detected_language and not self.language:
+                self.language = self._proc.detected_language
+
+            for (a, b, t) in committed:
+                # Pause-based split BEFORE appending the next word.
+                if (
+                    self._open_words
+                    and a - self._open_words[-1][1] >= self.PAUSE_SPLIT_S
+                ):
+                    seg = self._close_segment()
+                    if seg:
+                        to_send.append(seg)
+                self._open_words.append((a, b, t))
+                to_send.extend(self._maybe_close_on_rules())
+
+            partial_text = " ".join(t.strip() for _, _, t in partial).strip()
+            open_text = " ".join(t.strip() for _, _, t in self._open_words).strip()
+            changed_partial = (
+                partial_text != self._last_partial_text or bool(committed)
+            )
+            self._last_partial_text = partial_text
+
+        for seg in to_send:
+            try:
+                await self.ws.send_json({"type": "final", **seg})
+            except Exception:  # noqa: BLE001
+                pass
+        if changed_partial:
+            try:
+                await self.ws.send_json({
+                    "type": "partial",
+                    # confirmed-but-unsegmented + current hypothesis tail
+                    "text": (open_text + " " + partial_text).strip(),
+                    "confirmed_text": open_text,
+                    "hypothesis_text": partial_text,
+                })
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ---- finalize --------------------------------------------------------
+
+    async def finalize(self) -> Dict[str, Any]:
+        async with self.lock:
+            if not self.stop_requested:
+                # One last pass over whatever arrived, then flush the tail.
+                try:
+                    committed, _ = await asyncio.to_thread(self._proc.process_iter)
+                    for w in committed:
+                        self._open_words.append(w)
+                    tail, _ = self._proc.finish()
+                    for w in tail:
+                        self._open_words.append(w)
+                except Exception:  # noqa: BLE001
+                    logger.exception("LocalAgreement finalize pass failed")
+            seg = self._close_segment()
+        if seg is not None:
+            try:
+                await self.ws.send_json({"type": "final", **seg})
+            except Exception:  # noqa: BLE001
+                pass
+
+        outputs = self._write_outputs()
+        total_s = (
+            self.segments[-1]["end"] if self.segments else 0.0
+        )
+        outputs["duration_s"] = round(float(total_s), 3)
+        outputs["segments"] = len(self.segments)
+        logger.info(
+            "LocalAgreement session %s finalized (%d segments, %.1fs)",
+            self.session_id, len(self.segments), outputs["duration_s"],
+        )
+        return outputs
+
+    # ---- output writers (same format as legacy) --------------------------
+
+    def _write_outputs(self) -> Dict[str, str]:
+        out_dir = DOWNLOAD_DIR / self.session_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        srt_lines: List[str] = []
+        for idx, seg in enumerate(self.segments, start=1):
+            srt_lines.append(str(idx))
+            srt_lines.append(
+                f"{srt_timestamp(seg['start'])} --> {srt_timestamp(seg['end'])}"
+            )
+            srt_lines.append(seg["text"])
+            srt_lines.append("")
+        (out_dir / "transcript.srt").write_text("\n".join(srt_lines), encoding="utf-8")
+
+        txt_body = " ".join(seg["text"] for seg in self.segments).strip()
+        txt_body = _apply_name_corrections(txt_body) + "\n"
+        (out_dir / "transcript.txt").write_text(txt_body, encoding="utf-8")
+
+        return {
+            "srt_url": f"/download/{self.session_id}/transcript.srt",
+            "txt_url": f"/download/{self.session_id}/transcript.txt",
+        }
+
+
+def _make_streaming_session(
+    ws: WebSocket,
+    language: Optional[str] = None,
+    initial_prompt: Optional[str] = None,
+):
+    """Choose the streaming engine. LocalAgreement needs the faster-whisper
+    backend; MLX (Apple dev) and the explicit legacy flag fall back to the
+    original chunked session."""
+    if STREAMING_ENGINE == "localagreement" and EFFECTIVE_BACKEND == "whisperx":
+        try:
+            return LocalAgreementStreamingSession(ws, language, initial_prompt)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "LocalAgreement session unavailable (%s) — using legacy engine", exc
+            )
+    return StreamingSession(ws, language, initial_prompt)
+
+
 @app.websocket("/ws/stt")
 async def websocket_stt(ws: WebSocket) -> None:
     """Real-time streaming STT over WebSocket.
@@ -4208,7 +4471,7 @@ async def websocket_stt(ws: WebSocket) -> None:
                     if session is not None:
                         await ws.send_json({"type": "error", "error": "session already started"})
                         continue
-                    session = StreamingSession(
+                    session = _make_streaming_session(
                         ws,
                         language=data.get("language"),
                         initial_prompt=data.get("initial_prompt"),
@@ -4565,11 +4828,12 @@ async def websocket_s2s(ws: WebSocket) -> None:
                         .strip()
                         .lower()
                     )
-                    # Validate target_lang up-front so the user gets a clear
-                    # error rather than silent fall-through to default.
+                    # Validate target_lang up-front (against the ACTIVE MT
+                    # backend's vocabulary) so the user gets a clear error
+                    # rather than silent fall-through to default.
                     try:
-                        from s2s.translator import iso1_to_flores
-                        iso1_to_flores(target_lang)
+                        from s2s.translator import ensure_supported_target
+                        await asyncio.to_thread(ensure_supported_target, target_lang)
                     except Exception as exc:  # noqa: BLE001
                         await ws.send_json({
                             "type": "error",
@@ -4581,7 +4845,7 @@ async def websocket_s2s(ws: WebSocket) -> None:
                     # ids fall back to the default preset in the TTS backend).
                     voice = (data.get("voice") or s2s_tts.DEFAULT_VOICE).strip() or None
 
-                    session = StreamingSession(
+                    session = _make_streaming_session(
                         ws,
                         language=data.get("language"),
                         initial_prompt=data.get("initial_prompt"),
@@ -4654,11 +4918,11 @@ async def websocket_s2s(ws: WebSocket) -> None:
                     await ws.send_json({"type": "error", "error": f"invalid PCM frame: {exc}"})
                     continue
                 async with session.lock:
-                    prev_len = len(session.buffer)
+                    first_frame = not getattr(session, "_got_audio", False)
                     session.add_audio(pcm)
-                    new_len = len(session.buffer)
-                if prev_len == 0 and new_len > 0:
-                    logger.info("Streaming session %s: first audio frame received (%d samples)", session.session_id, new_len)
+                    session._got_audio = True
+                if first_frame:
+                    logger.info("Streaming session %s: first audio frame received (%d samples)", session.session_id, pcm.size)
 
     except WebSocketDisconnect:
         pass

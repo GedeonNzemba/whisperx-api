@@ -1,0 +1,19 @@
+# Keep the Docker build context small — these never belong in the image.
+.git
+.venv
+.cache
+models/
+mlx_models/
+media/
+omnivoice_samples/
+*.m4a
+*.wav
+*.log
+*.txt
+!requirements.txt
+!requirements-hf.txt
+!omnivoice_tts/requirements-omnivoice.txt
+!vibevoice/requirements-vibevoice.txt
+.DS_Store
+result.json
+transcript.srt

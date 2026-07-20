@@ -32,7 +32,8 @@ if [ -n "${GIT_REPO:-}" ]; then
     echo "[start.sh] Pulling latest code from $GIT_REPO"
     _BRANCH="${GIT_BRANCH:-main}"
     _RAW_BASE="https://raw.githubusercontent.com/$(echo "$GIT_REPO" | sed 's|https://github.com/||' | sed 's|\.git$||')"
-    for _file in server.py static/index.html s2s/translator.py s2s/tts.py start.sh; do
+    for _file in server.py static/index.html s2s/translator.py s2s/tts.py \
+                 streaming_asr.py omnivoice_client.py omnivoice_tts/sidecar.py start.sh; do
         curl -fsSL "${_RAW_BASE}/${_BRANCH}/${_file}" -o "/app/${_file}" 2>/dev/null && \
             echo "[start.sh] Updated ${_file}" || \
             echo "[start.sh] Skipped ${_file} (not found or no network)"
@@ -59,10 +60,36 @@ if [ "${DIARIZATION_BACKEND:-auto}" = "vibevoice" ]; then
     export VIBEVOICE_VENV="$VENV_DIR"
 fi
 
+# ── Ensure MADLAD-400 MT model (Apache 2.0 — the commercial-safe default) ─────
+# CT2 int8 conversion (~3 GB) on the Network Volume. curl with resume/retries
+# (same rationale as the OmniVoice fetch: HF's downloader stalls on this pod).
+# Runs only when MT_BACKEND is madlad (the default).
+if [ "${MT_BACKEND:-madlad}" = "madlad" ]; then
+    MADLAD_DIR="${MADLAD_MODEL_DIR:-/models/madlad400-3b-mt-ct2-int8}"
+    if [ ! -s "$MADLAD_DIR/model.bin" ]; then
+        echo "[start.sh] Fetching MADLAD-400 CT2 model to $MADLAD_DIR ..."
+        mkdir -p "$MADLAD_DIR"
+        _MDBASE="https://huggingface.co/Nextcloud-AI/madlad400-3b-mt-ct2-int8/resolve/main"
+        for _f in config.json generation_config.json added_tokens.json special_tokens_map.json tokenizer_config.json spiece.model shared_vocabulary.json model.bin; do
+            if [ ! -s "$MADLAD_DIR/$_f" ]; then
+                curl -fL --retry 12 --retry-delay 3 --retry-all-errors -C - \
+                    -o "$MADLAD_DIR/$_f" "${_MDBASE}/${_f}" 2>/dev/null \
+                    && echo "[start.sh] MADLAD got $_f" \
+                    || echo "[start.sh] MADLAD fetch FAILED for $_f (translator will error until present)"
+            fi
+        done
+    else
+        echo "[start.sh] MADLAD model already present at $MADLAD_DIR"
+    fi
+fi
+
 # ── Pre-cache NLLB tokenizer so S2S warmup succeeds on first start ────────────
+# Only relevant for the NON-COMMERCIAL dev fallback (MT_BACKEND=nllb).
 # Writes to HF_HOME (/models/hf) which is on the Network Volume — persisted.
 # Skips silently if already cached or if network is unavailable.
-if python -c "
+if [ "${MT_BACKEND:-madlad}" != "nllb" ]; then
+    echo "[start.sh] MT_BACKEND is not nllb — skipping NLLB tokenizer pre-cache"
+elif python -c "
 import os, sys
 cache = os.path.join(os.environ.get('HF_HOME', '/models/hf'), 'hub')
 # Check if sentencepiece model already cached

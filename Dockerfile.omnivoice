@@ -24,6 +24,7 @@ RUN python3 -m venv --system-site-packages /opt/omnivoice-venv && \
 COPY server.py /app/server.py
 COPY static /app/static
 COPY s2s/ /app/s2s/
+COPY streaming_asr.py /app/streaming_asr.py
 COPY omnivoice_tts/ /app/omnivoice_tts/
 COPY omnivoice_client.py /app/omnivoice_client.py
 COPY start.sh /app/start.sh

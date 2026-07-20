@@ -1735,6 +1735,11 @@ baAddRow();
       if (msg.type === 'ready') {
         setRtStatus('🔴 listening', '');
         startAudioCapture();
+      } else if (msg.type === 'partial') {
+        // Live unconfirmed hypothesis (LocalAgreement engine): render the
+        // confirmed transcript so far + the in-flight tail in muted style.
+        const confirmed = segmentsAcc.map(s => s.text).join(' ');
+        transcriptEl.textContent = (confirmed + ' ' + (msg.text || '')).trim() + ' …';
       } else if (msg.type === 'final') {
         segmentsAcc.push(msg);
         transcriptEl.textContent = segmentsAcc.map(s => s.text).join(' ');
@@ -2343,6 +2348,12 @@ baAddRow();
         case 'ready':
           log(`session ready · id=${msg.session_id} sr=${msg.sample_rate} backend=${msg.tts_backend}`);
           setStatus('🔴 Recording — speak now…', 'ok');
+          break;
+        case 'partial':
+          // Live hypothesis stream — instant feedback while speaking.
+          if (msg.text) {
+            transcriptEl.textContent = msg.text + ' …';
+          }
           break;
         case 'final':
           if (msg.text) {
