@@ -103,6 +103,15 @@ ISO1_TO_MADLAD_OVERRIDES: dict[str, str] = {
     "nb": "no",
 }
 
+# Target languages whose MADLAD OUTPUT is broken despite the token existing in
+# the vocabulary. Validated June 2026 on BOTH 3B and 7B-bt: en→ln produces
+# French/Swahili/gibberish (contaminated Lingala web data). We refuse these
+# targets with a clear error instead of silently returning wrong-language text.
+# (Lingala as a SOURCE language still works — e.g. speak-Lingala → English —
+# and OmniVoice TTS can still speak Lingala text.) Path to support: fine-tune
+# MADLAD on clean ln corpora (JW300/Bible/AFRIDOC) — tracked on the roadmap.
+MADLAD_BROKEN_TARGETS: frozenset[str] = frozenset({"ln"})
+
 
 def iso1_to_flores(code: str) -> str:
     """Map ISO-639-1 → FLORES (nllb). Pass-through for FLORES-style codes."""
@@ -185,8 +194,11 @@ class MadladTranslator:
         return ISO1_TO_MADLAD_OVERRIDES.get(code, code)
 
     def supports(self, code: str) -> bool:
-        """True iff the ``<2xx>`` token exists in the model vocabulary."""
+        """True iff the ``<2xx>`` token exists in the model vocabulary AND the
+        pair is not on the known-broken-output list."""
         try:
+            if self._madlad_code(code) in MADLAD_BROKEN_TARGETS:
+                return False
             self._ensure_loaded()
             tok = f"<2{self._madlad_code(code)}>"
             return self._sp.piece_to_id(tok) != self._sp.unk_id()
@@ -196,6 +208,12 @@ class MadladTranslator:
     def ensure_supported_target(self, code: str) -> None:
         if not code or not code.strip():
             raise ValueError("language code is empty")
+        if self._madlad_code(code) in MADLAD_BROKEN_TARGETS:
+            raise ValueError(
+                f"target language {code!r} is not reliably supported by the "
+                "current MT model (MADLAD-400 outputs wrong-language text for "
+                "it). Speaking it as a SOURCE language still works."
+            )
         if not self.supports(code):
             raise ValueError(
                 f"target language {code!r} is not in the MADLAD vocabulary"
