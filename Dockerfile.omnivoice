@@ -1,0 +1,37 @@
+# Delta image: adds the OmniVoice multilingual-TTS sidecar (isolated venv) on top
+# of the cuDNN-9 base image, plus the multilingual S2S code. The OmniVoice model
+# itself lives on the Network Volume and is ensured by start.sh via curl (HF's
+# downloader hangs on the 805 MB audio_tokenizer file).
+#
+# Why a delta: cross-building the full CUDA+torch stack under QEMU on arm64 is
+# impractically slow; this overlays only the new venv + code on the already-built
+# base. The OmniVoice venv install (transformers 5.x etc.) is a few hundred MB —
+# torch 2.6 is inherited from the base via --system-site-packages, not re-downloaded.
+FROM nzemba48/whisperx-api:cudnn9-20260607
+
+# Isolated venv for OmniVoice (needs transformers>=5.3, which we do NOT want to
+# force on the main server's whisperx/ctranslate2 stack — it runs on 5.2).
+# --system-site-packages inherits the base image's torch 2.6 / torchaudio so the
+# multi-GB torch is NOT re-downloaded; only omnivoice + its transformers + the
+# sidecar's fastapi/uvicorn land in the venv.
+RUN python3 -m venv --system-site-packages /opt/omnivoice-venv && \
+    /opt/omnivoice-venv/bin/pip install --no-cache-dir -U pip && \
+    /opt/omnivoice-venv/bin/pip install --no-cache-dir \
+        omnivoice hf_transfer fastapi "uvicorn[standard]" && \
+    /opt/omnivoice-venv/bin/python -c "import omnivoice, transformers; print('omnivoice venv ok; transformers', transformers.__version__)"
+
+# New / updated application code
+COPY server.py /app/server.py
+COPY static /app/static
+COPY s2s/ /app/s2s/
+COPY omnivoice_tts/ /app/omnivoice_tts/
+COPY omnivoice_client.py /app/omnivoice_client.py
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+
+# Default to the multilingual backend + the baked venv path.
+# NOTE: a TTS_BACKEND env var set on the RunPod pod OVERRIDES this image default —
+# set TTS_BACKEND=omnivoice on the pod too when deploying this image.
+ENV TTS_BACKEND=omnivoice \
+    OMNIVOICE_VENV=/opt/omnivoice-venv \
+    OMNIVOICE_MODEL_PATH=/models/omnivoice_local

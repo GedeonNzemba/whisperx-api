@@ -34,19 +34,17 @@ RUN pip install torch==2.6.0 torchaudio==2.6.0 \
 RUN pip install -r /app/requirements.txt && \
     pip install chatterbox-tts
 
-# We need TWO cuDNN versions simultaneously:
-#   cuDNN 8 (libcudnn_ops_infer.so.8) — required by CTranslate2/WhisperX
-#   cuDNN 9 (libcudnn.so.9)           — required by PyTorch 2.6
-#
-# Strategy: install cuDNN 8 first, copy its .so files to /usr/local/lib/cudnn8/,
-# then reinstall cuDNN 9 (which torch already declared as a dep). Register both
-# directories with ldconfig so the system linker finds both at runtime.
-RUN pip install nvidia-cudnn-cu12==8.9.7.29 && \
-    mkdir -p /usr/local/lib/cudnn8 && \
-    cp /usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib/libcudnn*.so* \
-       /usr/local/lib/cudnn8/ && \
-    pip install nvidia-cudnn-cu12==9.1.0.70 && \
-    printf '/usr/local/lib/cudnn8\n/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib\n' \
+# ── CTranslate2 4.5.0 (cuDNN 9) — single-cuDNN stack ──────────────────────────
+# whisperx 3.3.1 pins ctranslate2<4.5.0 (cuDNN 8), which is INCOMPATIBLE with
+# torch 2.6's cuDNN 9 and causes a native `libcudnn_ops_infer.so.8` abort the
+# moment CTranslate2 runs a GPU forward pass (killed the whole uvicorn process,
+# breaking /ws/s2s). CTranslate2 4.5.0 added cuDNN 9 support, so the ENTIRE stack
+# (torch + CTranslate2) now shares torch's bundled cuDNN 9 — no fragile dual
+# cuDNN install needed. faster-whisper 1.1.0 allows it; whisperx works fine with
+# 4.5.0 (whisperX #1158). --no-deps so numpy/torch are untouched. Last install
+# step so nothing downgrades it. Validated live on RTX 4090 (CT2_GPU_OK).
+RUN pip install --force-reinstall --no-deps ctranslate2==4.5.0 && \
+    printf '/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib\n' \
         > /etc/ld.so.conf.d/zzz-nvidia-cudnn.conf && \
     ldconfig
 
@@ -78,9 +76,8 @@ RUN ln -sf /usr/bin/python3.10 /usr/local/bin/python && \
 # Copy installed Python packages from builder.
 COPY --from=builder /usr/local/lib/python3.10/dist-packages /usr/local/lib/python3.10/dist-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
-# cuDNN 8 .so files saved separately so both cuDNN 8 and 9 are available.
-COPY --from=builder /usr/local/lib/cudnn8 /usr/local/lib/cudnn8
-# Register both cuDNN versions with the runtime linker.
+# Register torch's bundled cuDNN 9 dir with the runtime linker. CTranslate2 4.5.0
+# and PyTorch 2.6 both use this single cuDNN 9 (see builder stage comment).
 COPY --from=builder /etc/ld.so.conf.d/zzz-nvidia-cudnn.conf /etc/ld.so.conf.d/zzz-nvidia-cudnn.conf
 RUN ldconfig
 

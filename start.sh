@@ -14,12 +14,13 @@ if [ -w /etc/resolv.conf ]; then
     printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
 fi
 
-# ── cuDNN: belt-and-suspenders LD_LIBRARY_PATH ────────────────────────────────
-# ldconfig baked into the image is the primary fix; this covers edge cases
-# where the linker cache is stale or a sub-process resets the environment.
-# Include both cuDNN 8 (for CTranslate2) and cuDNN 9 (for PyTorch).
-# /models/cudnn8 is on the Network Volume — persisted cuDNN 8 libs survive image rebuilds.
-for _dir in /models/cudnn8 /usr/local/lib/cudnn8 /usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib; do
+# ── cuDNN 9: belt-and-suspenders LD_LIBRARY_PATH ──────────────────────────────
+# ldconfig baked into the image is the primary fix; this covers edge cases where
+# the linker cache is stale or a sub-process resets the environment. Since
+# CTranslate2 4.5.0, BOTH PyTorch 2.6 and CTranslate2 use the SAME cuDNN 9 that
+# torch bundles — no separate cuDNN 8 needed (that caused the old
+# libcudnn_ops_infer.so.8 crash). See Dockerfile for the full rationale.
+for _dir in /usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib; do
     if [ -d "$_dir" ]; then
         export LD_LIBRARY_PATH="${_dir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     fi
@@ -80,6 +81,30 @@ AutoTokenizer.from_pretrained(
 )
 print('[start.sh] NLLB tokenizer cached.')
 " 2>&1 || echo "[start.sh] NLLB tokenizer pre-cache failed (no network?) — will retry at first translation"
+fi
+
+# ── Ensure OmniVoice TTS model is present (only when using that backend) ──────
+# The sidecar venv is baked into the image; the model lives on the Network
+# Volume (persisted). HF's own downloader hangs on the 805MB audio_tokenizer
+# file, so we fetch with curl (robust resume + retries). No-op if already
+# complete. Runs only when TTS_BACKEND=omnivoice to avoid needless work.
+if [ "${TTS_BACKEND:-}" = "omnivoice" ] || [ "${TTS_BACKEND:-}" = "omni" ]; then
+    OMNI_DIR="${OMNIVOICE_MODEL_PATH:-/models/omnivoice_local}"
+    if [ ! -s "$OMNI_DIR/model.safetensors" ] || [ ! -s "$OMNI_DIR/audio_tokenizer/model.safetensors" ]; then
+        echo "[start.sh] Fetching OmniVoice model to $OMNI_DIR (curl, robust) ..."
+        mkdir -p "$OMNI_DIR/audio_tokenizer"
+        _OVBASE="https://huggingface.co/k2-fsa/OmniVoice/resolve/main"
+        for _f in config.json tokenizer.json tokenizer_config.json chat_template.jinja model.safetensors audio_tokenizer/config.json audio_tokenizer/model.safetensors; do
+            if [ ! -s "$OMNI_DIR/$_f" ]; then
+                curl -fL --retry 12 --retry-delay 3 --retry-all-errors -C - \
+                    -o "$OMNI_DIR/$_f" "${_OVBASE}/${_f}" 2>/dev/null \
+                    && echo "[start.sh] OmniVoice got $_f" \
+                    || echo "[start.sh] OmniVoice fetch FAILED for $_f (will retry at sidecar load)"
+            fi
+        done
+    else
+        echo "[start.sh] OmniVoice model already present at $OMNI_DIR"
+    fi
 fi
 
 echo "[start.sh] Starting uvicorn on ${HOST:-0.0.0.0}:${PORT:-8000}"

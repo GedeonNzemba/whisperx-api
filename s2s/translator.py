@@ -53,6 +53,16 @@ ISO1_TO_FLORES: dict[str, str] = {
     "id": "ind_Latn",
     "ms": "zsm_Latn",
     "sw": "swh_Latn",
+    # African languages (NLLB-200 FLORES codes) — match OmniVoice TTS coverage
+    "ln": "lin_Latn",   # Lingala
+    "yo": "yor_Latn",   # Yoruba
+    "ha": "hau_Latn",   # Hausa
+    "ig": "ibo_Latn",   # Igbo
+    "zu": "zul_Latn",   # Zulu
+    "sn": "sna_Latn",   # Shona
+    "am": "amh_Ethi",   # Amharic
+    "wo": "wol_Latn",   # Wolof
+    "tw": "twi_Latn",   # Twi
     "af": "afr_Latn",
     "sv": "swe_Latn",
     "no": "nob_Latn",

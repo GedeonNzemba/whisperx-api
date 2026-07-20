@@ -39,16 +39,69 @@ logger = logging.getLogger("s2s.tts")
 TTS_BACKEND = os.environ.get("TTS_BACKEND", "chatterbox-turbo").strip().lower() or "chatterbox-turbo"
 TTS_REFERENCE_VOICE = os.environ.get("TTS_REFERENCE_VOICE", "").strip() or None
 
+# ---------------------------------------------------------------------------
+# Voice-design presets (OmniVoice ``instruct`` strings)
+# ---------------------------------------------------------------------------
+# Each preset id maps to a valid OmniVoice voice-design instruction. Valid
+# vocabulary (docs/voice-design.md): gender=male|female; age=child|teenager|
+# young adult|middle-aged|elderly; pitch=very low|low|moderate|high|very high
+# pitch; style=whisper. (Accents are English-only and intentionally omitted so
+# the presets stay neutral across the African/other target languages.)
+VOICE_PRESETS: dict[str, str] = {
+    "male_warm":      "male, middle-aged, moderate pitch",
+    "male_deep":      "male, middle-aged, low pitch",
+    "male_elderly":   "male, elderly, low pitch",
+    "male_young":     "male, young adult, moderate pitch",
+    "female_clear":   "female, young adult, moderate pitch",
+    "female_bright":  "female, young adult, high pitch",
+    "female_warm":    "female, middle-aged, moderate pitch",
+    "female_elderly": "female, elderly, low pitch",
+}
+DEFAULT_VOICE = os.environ.get("TTS_DEFAULT_VOICE", "male_warm").strip() or "male_warm"
+
+
+def voice_to_instruct(voice: Optional[str]) -> Optional[str]:
+    """Map a preset id (or a raw instruct string) to an OmniVoice instruct.
+    Unknown/blank -> the default preset. A value already containing a comma is
+    treated as a raw instruct and passed through."""
+    if voice and "," in voice:
+        return voice  # caller supplied a raw instruct string
+    return VOICE_PRESETS.get((voice or DEFAULT_VOICE), VOICE_PRESETS.get(DEFAULT_VOICE))
+
+
+# ISO-639-1 -> ISO-639-3 for OmniVoice's ``language`` arg. Covers the S2S target
+# set (major + African). Extend as needed; unknown codes fall through to None
+# (OmniVoice then auto-detects from the text).
+ISO1_TO_ISO3_TTS: dict[str, str] = {
+    "en": "eng", "fr": "fra", "es": "spa", "de": "deu", "it": "ita", "pt": "por",
+    "nl": "nld", "ru": "rus", "uk": "ukr", "pl": "pol", "ar": "arb", "he": "heb",
+    "hi": "hin", "ja": "jpn", "ko": "kor", "zh": "cmn", "tr": "tur", "vi": "vie",
+    # African languages (OmniVoice-supported)
+    "sw": "swh", "yo": "yor", "ha": "hau", "ig": "ibo", "ln": "lin", "zu": "zul",
+    "sn": "sna", "am": "amh", "wo": "wol", "tw": "twi",
+}
+
+
+def iso1_to_iso3_tts(code: Optional[str]) -> Optional[str]:
+    if not code:
+        return None
+    code = code.strip().lower()
+    if len(code) == 3:
+        return code  # already ISO-639-3
+    return ISO1_TO_ISO3_TTS.get(code)
+
 
 class TTSBackend(Protocol):
     """Structural type every backend must satisfy."""
 
     sample_rate: int
-    language: str
+    language: str        # ISO-639-1 of the fixed output lang, or "multi"
+    multilingual: bool   # True if synthesize honours the `language` argument
 
     def warmup(self) -> None: ...
 
-    def synthesize(self, text: str) -> np.ndarray: ...
+    def synthesize(self, text: str, *, language: Optional[str] = None,
+                   voice: Optional[str] = None) -> np.ndarray: ...
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +119,7 @@ class ChatterboxTurboBackend:
 
     sample_rate: int = 24_000  # populated for real once model loads
     language: str = "en"
+    multilingual: bool = False
 
     def __init__(
         self,
@@ -118,7 +172,9 @@ class ChatterboxTurboBackend:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Chatterbox-Turbo warm-up failed: %s", exc)
 
-    def synthesize(self, text: str) -> np.ndarray:
+    def synthesize(self, text: str, *, language: Optional[str] = None,
+                   voice: Optional[str] = None) -> np.ndarray:
+        # English-only backend: `language` and `voice` are ignored.
         text = (text or "").strip()
         if not text:
             return np.zeros(0, dtype=np.float32)
@@ -194,6 +250,61 @@ class Qwen3TTSBackend:
 
 
 # ---------------------------------------------------------------------------
+# OmniVoice (multilingual, Apache 2.0) — via isolated sidecar
+# ---------------------------------------------------------------------------
+
+
+class OmniVoiceBackend:
+    """Multilingual TTS backed by the isolated OmniVoice sidecar.
+
+    k2-fsa/OmniVoice — Apache 2.0, 646 languages including African (Lingala,
+    Yoruba, Hausa, Igbo, Swahili, Zulu, Amharic, Twi, Wolof, Shona). Voice
+    selection via voice-design presets (see ``VOICE_PRESETS``). The heavy model
+    (transformers 5.x) runs in a separate venv; we only talk HTTP to it, so the
+    main server's whisperx/ctranslate2 stack is untouched.
+    """
+
+    sample_rate: int = 24_000
+    language: str = "multi"
+    multilingual: bool = True
+
+    def __init__(self) -> None:
+        import omnivoice_client  # main-venv client; no transformers import
+
+        self._client = omnivoice_client
+
+    def warmup(self) -> None:
+        # Raises on failure so the server's lifespan records the warm-up error
+        # and /ws/s2s rejects connections until the sidecar is genuinely ready.
+        if not self._client.ensure_sidecar_running():
+            err = (self._client.health() or {}).get("error")
+            raise RuntimeError(
+                f"OmniVoice sidecar failed to become ready"
+                + (f": {err}" if err else "")
+            )
+        h = self._client.health() or {}
+        try:
+            self.sample_rate = int(h.get("sample_rate", 24_000))
+        except Exception:  # noqa: BLE001
+            pass
+        logger.info("OmniVoice sidecar ready (model=%s)", h.get("model"))
+
+    def synthesize(self, text: str, *, language: Optional[str] = None,
+                   voice: Optional[str] = None) -> np.ndarray:
+        text = (text or "").strip()
+        if not text:
+            return np.zeros(0, dtype=np.float32)
+        iso3 = iso1_to_iso3_tts(language)
+        instruct = voice_to_instruct(voice)
+        return self._client.synthesize(text, language=iso3, instruct=instruct)
+
+    def supports_language(self, iso1: Optional[str]) -> bool:
+        """OmniVoice covers 646 languages; we report support for anything we can
+        map to an ISO-639-3 code (or any 3-letter code passed through)."""
+        return iso1_to_iso3_tts(iso1) is not None
+
+
+# ---------------------------------------------------------------------------
 # Factory + module singleton
 # ---------------------------------------------------------------------------
 
@@ -206,11 +317,13 @@ def _build(name: str) -> TTSBackend:
     name = (name or "").strip().lower()
     if name in {"chatterbox-turbo", "chatterbox", ""}:
         return ChatterboxTurboBackend()
+    if name in {"omnivoice", "omni"}:
+        return OmniVoiceBackend()
     if name == "qwen3-tts":
         return Qwen3TTSBackend()
     raise ValueError(
         f"Unknown TTS_BACKEND={name!r}. "
-        f"Supported: chatterbox-turbo, qwen3-tts."
+        f"Supported: chatterbox-turbo, omnivoice, qwen3-tts."
     )
 
 
@@ -226,7 +339,13 @@ def get_tts() -> TTSBackend:
 
 def is_available() -> bool:
     """Lightweight check (does NOT load weights). True when env-var maps to
-    a non-stub backend AND the underlying package is import-able."""
+    a usable backend.
+
+    * chatterbox: the package must import in THIS venv.
+    * omnivoice: the sidecar runs in a SEPARATE venv, so we don't import
+      anything here — readiness is probed live via the sidecar /health and
+      reported through availability_error().
+    """
     name = (TTS_BACKEND or "chatterbox-turbo").lower()
     if name in {"chatterbox-turbo", "chatterbox"}:
         try:
@@ -238,16 +357,32 @@ def is_available() -> bool:
                 type(exc).__name__, exc,
             )
             return False
+    if name in {"omnivoice", "omni"}:
+        try:
+            import omnivoice_client
+            return omnivoice_client.is_available(timeout=2.0)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("omnivoice_client probe failed: %s", exc)
+            return False
     return False  # qwen3-tts stub not available
 
 
 def availability_error() -> str:
-    """Return the import error string if is_available() is False, else ''."""
+    """Return the unavailability reason if is_available() is False, else ''."""
     name = (TTS_BACKEND or "chatterbox-turbo").lower()
     if name in {"chatterbox-turbo", "chatterbox"}:
         try:
             import chatterbox.tts_turbo  # noqa: F401
             return ""
+        except Exception as exc:  # noqa: BLE001
+            return f"{type(exc).__name__}: {exc}"
+    if name in {"omnivoice", "omni"}:
+        try:
+            import omnivoice_client
+            if omnivoice_client.is_available(timeout=2.0):
+                return ""
+            h = omnivoice_client.health()
+            return (h or {}).get("error") or "OmniVoice sidecar not ready (still loading or failed to start)."
         except Exception as exc:  # noqa: BLE001
             return f"{type(exc).__name__}: {exc}"
     return "qwen3-tts backend not yet implemented"

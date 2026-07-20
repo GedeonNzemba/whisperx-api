@@ -780,33 +780,59 @@
     <div class="grid">
       <div class="card">
         <h3 style="margin:0 0 14px;font-size:15px;">🌐 Speech-to-Speech Translation</h3>
-        <p style="font-size:12px;color:var(--muted);margin:0 0 16px;">Speak in any language → transcribed → translated → spoken back in target language using Chatterbox-Turbo TTS.</p>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 16px;">Speak in any language → transcribed → translated → spoken back in your chosen target language &amp; voice using OmniVoice TTS (646 languages, incl. African).</p>
 
         <div class="field">
           <label>Source language (optional — auto-detect if blank)</label>
           <input type="text" id="s2s-src-lang" list="lang-list" placeholder="auto-detect" style="max-width:220px;">
         </div>
-        <div class="field">
-          <label>Target language</label>
-          <select id="s2s-tgt-lang" style="max-width:220px;">
-            <option value="en">English</option>
-            <option value="fr">French</option>
-            <option value="es">Spanish</option>
-            <option value="de">German</option>
-            <option value="it">Italian</option>
-            <option value="pt">Portuguese</option>
-            <option value="nl">Dutch</option>
-            <option value="ru">Russian</option>
-            <option value="zh">Chinese</option>
-            <option value="ja">Japanese</option>
-            <option value="ko">Korean</option>
-            <option value="ar">Arabic</option>
-            <option value="hi">Hindi</option>
-            <option value="tr">Turkish</option>
-            <option value="pl">Polish</option>
-            <option value="uk">Ukrainian</option>
-            <option value="sw">Swahili</option>
-          </select>
+        <div class="row">
+          <div class="field">
+            <label>Target language</label>
+            <select id="s2s-tgt-lang" style="max-width:220px;">
+              <option value="en">English</option>
+              <option value="fr">French</option>
+              <option value="es">Spanish</option>
+              <option value="de">German</option>
+              <option value="it">Italian</option>
+              <option value="pt">Portuguese</option>
+              <option value="nl">Dutch</option>
+              <option value="ru">Russian</option>
+              <option value="zh">Chinese</option>
+              <option value="ja">Japanese</option>
+              <option value="ko">Korean</option>
+              <option value="ar">Arabic</option>
+              <option value="hi">Hindi</option>
+              <option value="tr">Turkish</option>
+              <option value="pl">Polish</option>
+              <option value="uk">Ukrainian</option>
+              <optgroup label="African languages">
+                <option value="sw">Swahili</option>
+                <option value="ln">Lingala</option>
+                <option value="yo">Yoruba</option>
+                <option value="ha">Hausa</option>
+                <option value="ig">Igbo</option>
+                <option value="zu">Zulu</option>
+                <option value="sn">Shona</option>
+                <option value="am">Amharic</option>
+                <option value="wo">Wolof</option>
+                <option value="tw">Twi</option>
+              </optgroup>
+            </select>
+          </div>
+          <div class="field">
+            <label>Voice</label>
+            <select id="s2s-voice" style="max-width:220px;">
+              <option value="male_warm">Male — warm (default)</option>
+              <option value="male_deep">Male — deep</option>
+              <option value="male_young">Male — young</option>
+              <option value="male_elderly">Male — elderly</option>
+              <option value="female_clear">Female — clear</option>
+              <option value="female_bright">Female — bright</option>
+              <option value="female_warm">Female — warm</option>
+              <option value="female_elderly">Female — elderly</option>
+            </select>
+          </div>
         </div>
 
         <!-- ── Mic & Speaker Test ──────────────────────────────────── -->
@@ -1951,6 +1977,7 @@ baAddRow();
   const audioPhEl      = document.getElementById('s2s-audio-placeholder');
   const srcLangEl      = document.getElementById('s2s-src-lang');
   const tgtLangEl      = document.getElementById('s2s-tgt-lang');
+  const voiceEl        = document.getElementById('s2s-voice');
   const errorsEl       = document.getElementById('s2s-errors');
   const healthDotEl    = document.getElementById('s2s-health-dot');
   const healthTextEl   = document.getElementById('s2s-health-text');
@@ -2200,6 +2227,7 @@ baAddRow();
         type: 'start',
         language: srcLangEl.value.trim() || null,
         target_language: tgtLangEl.value || 'en',
+        voice: (voiceEl && voiceEl.value) || 'male_warm',
       };
       log('→ sending start:', startMsg);
       ws.send(JSON.stringify(startMsg));

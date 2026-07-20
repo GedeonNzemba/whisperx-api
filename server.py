@@ -4311,6 +4311,7 @@ async def _s2s_translate_and_speak(
     *,
     source_lang: str,
     target_lang: str,
+    voice: Optional[str] = None,
 ) -> None:
     """Translate a finalised STT segment and stream synthesised audio back.
 
@@ -4335,12 +4336,16 @@ async def _s2s_translate_and_speak(
         translator = s2s_translator.get_translator()
         tts = s2s_tts.get_tts()
 
-        # English-only TTS (Chatterbox) cannot synthesise non-English
-        # targets; decide up-front whether we will actually speak.
-        if tts.language == "en" and target_lang.lower() != "en":
-            audio_lang_supported = False
+        # Decide up-front whether we can actually speak the target language.
+        # Multilingual backends (OmniVoice) synthesise any supported target;
+        # single-language backends (Chatterbox, English-only) only speak when
+        # the target matches their fixed output language.
+        multilingual = bool(getattr(tts, "multilingual", False))
+        if multilingual:
+            supports = getattr(tts, "supports_language", None)
+            audio_lang_supported = supports(target_lang) if callable(supports) else True
         else:
-            audio_lang_supported = True
+            audio_lang_supported = (tts.language.lower() == target_lang.lower())
 
         def _do_translate_and_synthesise() -> tuple[str, Optional[np.ndarray], int]:
             """Runs in a worker thread. Returns (translated, audio_or_None, sample_rate)."""
@@ -4351,7 +4356,10 @@ async def _s2s_translate_and_speak(
                 return "", None, 0
             if not audio_lang_supported:
                 return translated_local, None, 0
-            audio_local = tts.synthesize(translated_local)
+            # Multilingual backends honour language+voice; others ignore them.
+            audio_local = tts.synthesize(
+                translated_local, language=target_lang, voice=voice
+            )
             sr_local = int(getattr(tts, "sample_rate", 24_000))
             return translated_local, audio_local, sr_local
 
@@ -4375,10 +4383,10 @@ async def _s2s_translate_and_speak(
                 "type": "audio_skipped",
                 "segment_id": seg_id,
                 "reason": (
-                    f"Active TTS backend ({s2s_tts.TTS_BACKEND}) supports "
-                    f"language {tts.language!r}; cannot synthesise "
-                    f"target_language={target_lang!r}. Set "
-                    "TTS_BACKEND=qwen3-tts when multilingual support lands."
+                    f"Active TTS backend ({s2s_tts.TTS_BACKEND}) cannot synthesise "
+                    f"target_language={target_lang!r} (backend output language: "
+                    f"{tts.language!r}). Use TTS_BACKEND=omnivoice for multilingual "
+                    "output (646 languages incl. African)."
                 ),
             })
             return
@@ -4478,6 +4486,7 @@ async def websocket_s2s(ws: WebSocket) -> None:
     process_task: Optional[asyncio.Task] = None
     pending_s2s_tasks: List[asyncio.Task] = []
     target_lang: str = S2S_TARGET_LANG_DEFAULT
+    voice: Optional[str] = None  # voice-design preset id for the TTS backend
     last_emitted_seg_id: int = -1
 
     async def periodic_processor() -> None:
@@ -4504,7 +4513,8 @@ async def websocket_s2s(ws: WebSocket) -> None:
                         src = (session.language or "en").lower()
                         task = asyncio.create_task(
                             _s2s_translate_and_speak(
-                                ws, seg, source_lang=src, target_lang=target_lang
+                                ws, seg, source_lang=src, target_lang=target_lang,
+                                voice=voice,
                             )
                         )
                         pending_s2s_tasks.append(task)
@@ -4567,6 +4577,10 @@ async def websocket_s2s(ws: WebSocket) -> None:
                         })
                         continue
 
+                    # Voice-design preset (validated against the registry; unknown
+                    # ids fall back to the default preset in the TTS backend).
+                    voice = (data.get("voice") or s2s_tts.DEFAULT_VOICE).strip() or None
+
                     session = StreamingSession(
                         ws,
                         language=data.get("language"),
@@ -4580,6 +4594,8 @@ async def websocket_s2s(ws: WebSocket) -> None:
                         "language": session.language,
                         "target_language": target_lang,
                         "tts_backend": s2s_tts.TTS_BACKEND,
+                        "voice": voice,
+                        "voices": list(s2s_tts.VOICE_PRESETS.keys()),
                     })
                 elif ctype == "end":
                     if session is None:
@@ -4608,7 +4624,8 @@ async def websocket_s2s(ws: WebSocket) -> None:
                             src = (session.language or "en").lower()
                             pending_s2s_tasks.append(asyncio.create_task(
                                 _s2s_translate_and_speak(
-                                    ws, seg, source_lang=src, target_lang=target_lang
+                                    ws, seg, source_lang=src, target_lang=target_lang,
+                                    voice=voice,
                                 )
                             ))
                     except Exception:  # noqa: BLE001

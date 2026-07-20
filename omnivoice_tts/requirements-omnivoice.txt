@@ -1,0 +1,14 @@
+# Isolated dependency set for the OmniVoice-TTS sidecar.
+# Install into a SEPARATE venv created with --system-site-packages so it INHERITS
+# the base image's torch 2.6 / torchaudio (no multi-GB re-download) but gets its
+# own transformers>=5.3 (required by omnivoice) WITHOUT disturbing the main
+# server's whisperx / ctranslate2 stack (which runs on transformers 5.2).
+#
+#   python3 -m venv --system-site-packages /models/omnivoice-venv
+#   /models/omnivoice-venv/bin/pip install -r omnivoice_tts/requirements-omnivoice.txt
+#
+# `omnivoice` pulls transformers>=5.3, accelerate, soundfile, librosa, numpy, etc.
+omnivoice>=0.1.5
+hf_transfer>=0.1.6
+fastapi>=0.110
+uvicorn[standard]>=0.27

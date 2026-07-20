@@ -1,0 +1,38 @@
+# Delta image — fast deploy of the proven cuDNN-9 / CTranslate2-4.5.0 fix on top
+# of the existing nzemba48/whisperx-api:latest, plus the latest application code.
+#
+# WHY a delta instead of a full rebuild: the full Dockerfile reinstalls torch 2.6
+# + chatterbox-tts + whisperx under linux/amd64, which is impractically slow to
+# cross-build under QEMU on an arm64 Mac. This overlays only the small fix on the
+# already-built base, so the build is minutes. The clean full Dockerfile carries
+# the same changes for a future native/CI rebuild.
+#
+# Fixes baked in:
+#   1. ctranslate2==4.5.0  → CTranslate2 uses cuDNN 9 (same as torch 2.6); ends the
+#      native `libcudnn_ops_infer.so.8` abort that killed the process on the first
+#      GPU forward pass (broke /ws/s2s). Validated live on RTX 4090 (CT2_GPU_OK).
+#   2. Latest application code (server.py etc.) → fixes the PyTorch-2.6
+#      omegaconf `weights_only` load error AND replaces the stale baked code that
+#      the broken boot-time git-pull never managed to update.
+#
+# Rollback: previous :latest = sha256:5f72c4908ec7561719cefe6a08ef2a67f2c672ad541691ce21f12a7cf1eb15f0
+FROM nzemba48/whisperx-api:latest
+
+# Upgrade CTranslate2 to the cuDNN-9 line. --no-deps so numpy/torch are untouched.
+# Re-point ldconfig at torch's bundled cuDNN 9 (drop the old dual cuDNN-8 entry).
+RUN pip install --force-reinstall --no-deps ctranslate2==4.5.0 && \
+    printf '/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib\n' \
+        > /etc/ld.so.conf.d/zzz-nvidia-cudnn.conf && \
+    ldconfig && \
+    python -c "import ctranslate2; print('baked ctranslate2', ctranslate2.__version__)"
+
+# Bake the latest application code so the server no longer depends on the flaky
+# boot-time GitHub pull (which fails on RunPod DNS-at-boot and left stale code).
+COPY server.py /app/server.py
+COPY static /app/static
+COPY s2s/ /app/s2s/
+COPY vbx_diarize.py /app/vbx_diarize.py
+COPY vibevoice_client.py /app/vibevoice_client.py
+COPY vibevoice/ /app/vibevoice/
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh

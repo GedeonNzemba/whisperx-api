@@ -12,7 +12,12 @@ torchaudio==2.6.0
 faster-whisper==1.1.0
 whisperx==3.3.1
 pyannote.audio==3.3.2
-ctranslate2==4.4.0
+# ctranslate2 is NOT pinned here on purpose. whisperx 3.3.1 over-conservatively
+# caps it at <4.5.0 (cuDNN 8), which is INCOMPATIBLE with torch 2.6's cuDNN 9 and
+# causes a native `libcudnn_ops_infer.so.8` abort during the first GPU forward
+# pass. faster-whisper 1.1.0 allows <5,>=4.0, and whisperx works fine with 4.5.0
+# (whisperX issue #1158). The Dockerfile force-installs ctranslate2==4.5.0 AFTER
+# this file so the whole stack runs on cuDNN 9. Validated live on RTX 4090.
 
 # CPU-only diarization backend (default). Faster, no HF token required, lower DER.
 # Apache 2.0. https://github.com/FoxNoseTech/diarize
